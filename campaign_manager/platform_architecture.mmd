@@ -1,0 +1,239 @@
+flowchart TB
+
+%% =====================================================
+%% 1. EDGE LAYER
+%% =====================================================
+
+subgraph EDGE_LAYER["🌍 Edge Layer"]
+    DNS[Global DNS]
+    WAF[Web Application Firewall]
+    LB[Global Load Balancer]
+    APIGW[API Gateway<br/>• JWT Validation<br/>• Extract tenant_id<br/>• Per-Tenant Rate Limit]
+end
+
+DNS --> WAF --> LB --> APIGW
+
+
+%% =====================================================
+%% 2. IDENTITY & ACCESS DOMAIN
+%% =====================================================
+
+subgraph IDENTITY_DOMAIN["🔐 Identity & Access Domain"]
+    AUTH[Auth Service (JWT Issuer)]
+    ORG[Organization Service]
+    USER[User Service]
+    RBAC[Access Control (RBAC)]
+    ID_DB[(Identity Database)]
+end
+
+APIGW --> AUTH
+AUTH --> ORG
+AUTH --> USER
+AUTH --> RBAC
+AUTH --> ID_DB
+
+
+%% =====================================================
+%% 3. CONTROL PLANE (Tenant Management)
+%% =====================================================
+
+subgraph CONTROL_PLANE["⚙️ Control Plane (Tenant Management)"]
+    CP_API[Control Plane API]
+    TENANT_DB[(Tenant Metadata DB<br/>Schema-per-tenant)]
+    ROUTING_DB[(Tenant → Shard Mapping)]
+    POLICY_DB[(Quota & Campaign Policies)]
+    VAULT[(Encrypted Credential Vault)]
+end
+
+APIGW --> CP_API
+CP_API --> TENANT_DB
+CP_API --> ROUTING_DB
+CP_API --> POLICY_DB
+CP_API --> VAULT
+
+
+%% =====================================================
+%% 4. CRM INTEGRATION DOMAIN
+%% =====================================================
+
+subgraph CRM_DOMAIN["🔄 CRM Integration Domain"]
+    CRM_API[CRM Integration Service]
+    IMPORT[Contact Import Processor]
+    DEDUPE[Deduplication & Mapping Engine]
+    CONTACT_DB[(Contacts Write Database<br/>Partitioned by tenant_id)]
+end
+
+APIGW --> CRM_API
+CRM_API --> IMPORT
+IMPORT --> DEDUPE
+DEDUPE --> CONTACT_DB
+
+
+%% =====================================================
+%% 5. CAMPAIGN AUTHORING DOMAIN
+%% =====================================================
+
+subgraph AUTHORING_DOMAIN["📝 Campaign Authoring Domain"]
+    CAMPAIGN_API[Campaign Service]
+    TEMPLATE[Drag & Drop Template Builder]
+    TEMPLATE_STORE[(Template Version Store)]
+    PREVIEW[Render & Preview Service]
+    SEGMENT[Segmentation Service]
+    CONTACT_INDEX[(Contact Search Index<br/>Optimized for large queries)]
+    SNAPSHOT[(Audience Snapshot Store)]
+    OUTBOX[(Outbox Table)]
+end
+
+APIGW --> CAMPAIGN_API
+
+CAMPAIGN_API --> TEMPLATE
+TEMPLATE --> TEMPLATE_STORE
+CAMPAIGN_API --> PREVIEW
+
+CAMPAIGN_API --> SEGMENT
+CONTACT_DB --> CONTACT_INDEX
+SEGMENT --> CONTACT_INDEX
+SEGMENT --> SNAPSHOT
+
+CAMPAIGN_API --> OUTBOX
+
+
+%% =====================================================
+%% 6. EVENT STREAMING (KAFKA)
+%% =====================================================
+
+subgraph STREAMING_LAYER["📨 Event Streaming Layer"]
+    TOPIC_CAMPAIGN[(Kafka Topic: campaign.details)]
+    TOPIC_AUDIENCE[(Kafka Topic: campaign.audience)]
+    TOPIC_STATUS_RAW[(Kafka Topic: delivery.status.raw)]
+    TOPIC_STATUS_NORM[(Kafka Topic: delivery.status.normalized)]
+    TOPIC_ANALYTICS[(Kafka Topic: analytics.events)]
+    KAFKA[(Kafka Cluster<br/>Partitioned by tenant_id)]
+end
+
+OUTBOX --> TOPIC_CAMPAIGN
+SNAPSHOT --> TOPIC_AUDIENCE
+
+TOPIC_CAMPAIGN --> KAFKA
+TOPIC_AUDIENCE --> KAFKA
+
+
+%% =====================================================
+%% 7. DELIVERY DOMAIN (DATA PLANE)
+%% =====================================================
+
+subgraph DELIVERY_DOMAIN["🚀 Delivery Domain"]
+    ORCHESTRATOR[Delivery Orchestrator (Saga)]
+    COMPOSER[Message Composer]
+    WORKERS[Delivery Workers]
+    IDEMPOTENCY[Idempotency Store]
+    RATE_LIMIT[Per-Tenant Rate Limiter]
+    RETRY[Retry Engine]
+    CIRCUIT[Circuit Breaker]
+    DLQ[(Dead Letter Queue)]
+    PROVIDER_ADAPTER[Provider Adapter Layer]
+    DELIVERY_STORE[(Delivery Event Store<br/>State Machine)]
+end
+
+KAFKA --> ORCHESTRATOR
+ORCHESTRATOR --> COMPOSER
+COMPOSER --> WORKERS
+
+WORKERS --> IDEMPOTENCY
+WORKERS --> RATE_LIMIT
+WORKERS --> RETRY
+WORKERS --> CIRCUIT
+WORKERS --> PROVIDER_ADAPTER
+WORKERS --> DELIVERY_STORE
+WORKERS --> DLQ
+
+
+%% =====================================================
+%% 8. EXTERNAL CHANNEL PROVIDERS
+%% =====================================================
+
+subgraph CHANNEL_PROVIDERS["📡 External Channel Providers"]
+    EMAIL[Email Provider]
+    SMS[SMS Provider]
+    WHATSAPP[WhatsApp Business API]
+    SOCIAL[Instagram / Facebook / LinkedIn APIs]
+    PUSH[Push Notification Service]
+end
+
+PROVIDER_ADAPTER --> EMAIL
+PROVIDER_ADAPTER --> SMS
+PROVIDER_ADAPTER --> WHATSAPP
+PROVIDER_ADAPTER --> SOCIAL
+PROVIDER_ADAPTER --> PUSH
+
+
+%% =====================================================
+%% 9. STATUS INGESTION
+%% =====================================================
+
+subgraph STATUS_INGESTION["📥 Delivery Status Ingestion"]
+    WEBHOOK[Webhook Gateway]
+    VALIDATOR[Signature Validator]
+    NORMALIZER[Status Normalizer]
+end
+
+EMAIL --> WEBHOOK
+SMS --> WEBHOOK
+WHATSAPP --> WEBHOOK
+SOCIAL --> WEBHOOK
+PUSH --> WEBHOOK
+
+WEBHOOK --> VALIDATOR --> NORMALIZER
+NORMALIZER --> TOPIC_STATUS_RAW
+TOPIC_STATUS_RAW --> KAFKA
+KAFKA --> TOPIC_STATUS_NORM
+TOPIC_STATUS_NORM --> DELIVERY_STORE
+
+
+%% =====================================================
+%% 10. TRACKING SYSTEM
+%% =====================================================
+
+subgraph TRACKING_LAYER["🔍 Tracking Layer"]
+    REDIRECT[Click Redirect Service]
+    PIXEL[Open Tracking Pixel]
+end
+
+REDIRECT --> TOPIC_ANALYTICS
+PIXEL --> TOPIC_ANALYTICS
+
+
+%% =====================================================
+%% 11. ANALYTICS & REPORTING
+%% =====================================================
+
+subgraph ANALYTICS_DOMAIN["📊 Analytics & Reporting"]
+    STREAM_PROC[Stream Processor]
+    AGG_DB[(Analytics Aggregation DB<br/>Partitioned by tenant_id)]
+    REPORT_API[Reporting API]
+    INTELLIGENCE[Campaign Intelligence Engine]
+end
+
+KAFKA --> STREAM_PROC
+STREAM_PROC --> AGG_DB
+AGG_DB --> REPORT_API
+AGG_DB --> INTELLIGENCE
+REPORT_API --> APIGW
+
+
+%% =====================================================
+%% 12. OBSERVABILITY
+%% =====================================================
+
+subgraph OBSERVABILITY["📈 Observability"]
+    METRICS[Metrics]
+    LOGS[Centralized Logs]
+    TRACING[Distributed Tracing]
+    ALERTS[Alerting System]
+end
+
+WORKERS --> LOGS
+WORKERS --> TRACING
+KAFKA --> METRICS
+METRICS --> ALERTS
+LOGS --> ALERTS
