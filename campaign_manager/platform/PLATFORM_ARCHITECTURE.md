@@ -1,6 +1,4 @@
-# 🌍 Global Multi-Region SaaS Platform — Consolidated Architecture Document (Single File)
-
-> **Purpose:** Single-page, copy-ready, developer + operator-friendly architecture doc covering decisions, rationale, pros/cons, components, configuration highlights, alternatives, and failure scenario walkthroughs — with mermaid diagrams included.
+# 🌍 Platform Architecture Document
 
 ---
 
