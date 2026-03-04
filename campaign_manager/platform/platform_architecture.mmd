@@ -1,239 +1,430 @@
 flowchart TB
 
-%% =====================================================
-%% 1. EDGE LAYER
-%% =====================================================
+  %% =============================================
+  %% LAYER 0 — GLOBAL NETWORK & SECURITY
+  %% Owner: Infra/NetSec
+  %% =============================================
+  subgraph L0["🌐  LAYER 0 — Global Network & Security    [Owner: Infra/NetSec]"]
+    direction LR
 
-subgraph EDGE_LAYER["🌍 Edge Layer"]
-    DNS["Global DNS"]
-    WAF["Web Application Firewall"]
-    LB["Global Load Balancer"]
-    APIGW["API Gateway\n• JWT Validation\n• Extract tenant_id\n• Per-Tenant Rate Limit"]
-end
+    subgraph L0_NET["  Global Edge Network  "]
+      direction LR
+      CDN["🌍 CDN / Anycast Router\nCloudFront / Fastly\nMulti-region PoPs\nDDoS L3/L4 absorption\n[Net-Svc]"]
+      TLS["🔒 TLS Termination\nTLS 1.3 enforced\nCert rotation via ACM\nmTLS enforced service-to-service\n[Net-Svc]"]
+      DDOS_L7["🔥 L7 DDoS Protection\nAWS Shield Advanced\nHTTP flood · Slowloris\nCredential stuffing mitigation\n[SecOps-Svc]"]
+    end
 
-DNS --> WAF --> LB --> APIGW
+    subgraph L0_SEC["  Security Controls  "]
+      direction LR
+      WAF_L7["🛡️ WAF L7\nOWASP ruleset · Rate-rule per IP\nGeo-blocking · Payload size limit\nTemplate injection prevention\n[SecOps-Svc]"]
+      APIGW["🔌 API Gateway\nKong / AWS APIGW\nRoute versioning /v1 /v2\nDeprecation sunset enforcement\nPayload validation · Auth forwarding\n[Edge-Svc]"]
+      API_LIFECYCLE["📋 API Lifecycle Manager\nVersion deprecation notices\nSunset date headers RFC 8594\nMigration guide per major version\nBreaking-change policy enforced\n[Edge-Svc]"]
+      SECRETS["🔑 Secrets Manager\nVault / AWS Secrets Mgr\nAuto-rotation every 30d\nSidecar injection to ALL services\nService-to-service mTLS creds\n[SecOps-Svc]"]
+      COMPLIANCE["⚖️ Compliance Gateway\nGDPR right-to-erasure\nCAN-SPAM opt-out\nDMARC / SPF / DKIM\nPII classifier\n[Legal-Svc]"]
+    end
 
+    subgraph L0_MESH["  Service Mesh  "]
+      direction LR
+      MESH["🕸️ Service Mesh\nIstio / Linkerd\nmTLS on all east-west traffic\nPer-service traffic policy\nInternal retries · timeouts\nCircuit break on internal calls\n[Infra-Svc]"]
+    end
 
-%% =====================================================
-%% 2. IDENTITY & ACCESS DOMAIN
-%% =====================================================
+    subgraph L0_DEGRADE["  Degradation Contract  "]
+      direction LR
+      DEGRADE_POL["📉 Degradation Priority Policy\nTier 1: 2FA and transactional — never shed\nTier 2: Campaign sends — shed under load\nTier 3: Analytics — shed first\nTier 4: ML feedback — shed freely\nOwner: SRE enforces via DIST_QUOTA\n[SRE-Team]"]
+    end
 
-subgraph IDENTITY_DOMAIN["🔐 Identity & Access Domain"]
-    AUTH["Auth Service (JWT Issuer)"]
-    ORG["Organization Service"]
-    USER["User Service"]
-    RBAC["Access Control (RBAC)"]
-    ID_DB["Identity Database"]
-end
+    subgraph L0_OPTOUT["  Unsubscribe Ingestion  "]
+      direction LR
+      OPTOUT_WH["📩 Unsubscribe Webhook Receiver\nHMAC-SHA256 per provider\nIP allowlist enforced\nIdempotency key per event\nOne-click RFC 8058\n[Compliance-Svc]"]
+    end
 
-APIGW --> AUTH
-AUTH --> ORG
-AUTH --> USER
-AUTH --> RBAC
-AUTH --> ID_DB
+    CDN --> TLS --> DDOS_L7 --> WAF_L7 --> APIGW
+    APIGW --- API_LIFECYCLE
+    OPTOUT_WH -->|"Verified opt-out events"| COMPLIANCE
+  end
 
+  %% =============================================
+  %% LAYER 1 — INGRESS & IDENTITY
+  %% Owner: Platform/Infra
+  %% =============================================
+  subgraph L1["🛡️  LAYER 1 — Global Edge & Ingress    [Owner: Platform/Infra]"]
+    direction TB
 
-%% =====================================================
-%% 3. CONTROL PLANE (Tenant Management)
-%% =====================================================
+    subgraph L1_ENTRY["  Entry Points  "]
+      direction LR
+      UI["🖥️ UI / Authoring\nDrag-and-drop builder\nTemplate versioning\n[Product-Svc]"]
+      API["⚡ Developer API\nExternal integrations\nWebhook ingress\n[Edge-Svc]"]
+    end
 
-subgraph CONTROL_PLANE["⚙️ Control Plane (Tenant Management)"]
-    CP_API["Control Plane API"]
-    TENANT_DB["Tenant Metadata DB\n(Schema-per-tenant)"]
-    ROUTING_DB["Tenant → Shard Mapping"]
-    POLICY_DB["Quota & Campaign Policies"]
-    VAULT["Encrypted Credential Vault"]
-end
+    subgraph L1_GATE["  Gatekeeper — all traffic passes through this chain  "]
+      direction LR
+      AUTH["🔐 OIDC / RBAC Auth\nJWT validation · Tenant authz\nToken refresh · MFA enforcement\n[Auth-Svc]"]
+      TOKEN_REVOKE[("🚫 JWT Revocation Blocklist\nRedis-backed · TTL-aligned\nImmediate revoke on compromise\nAdmin offboard enforcement\n[Auth-Svc]")]
+      CTX["🏷️ Tenant Context Injector\nStamps tenant ID on every request\nData isolation enforcement\n[Edge-Svc]"]
+      CELL_ROUTER{"🔀 Cell Router\nRoutes by tenant cell\nPriority vs standard split\nL7 request inspection\n[Edge-Svc]"}
+      DIST_QUOTA["🚦 Distributed Rate Limiter\nRedis-backed token bucket\nPer-tenant quota\nAutomated SRE backpressure\nThreshold: Kafka lag over 5M\nShed Tier 3 and 4 first per policy\n[Traffic-Svc]"]
+    end
 
-APIGW --> CP_API
-CP_API --> TENANT_DB
-CP_API --> ROUTING_DB
-CP_API --> POLICY_DB
-CP_API --> VAULT
+    subgraph L1_SUPPRESS["  Suppression  "]
+      direction LR
+      SUPPRESSION["🚫 Suppression Check\nUnsubscribe · blocklist\nHard bounce registry\nGDPR erasure enforcement\nFail-open with audit log on DB outage\n[Compliance-Svc]"]
+      SUPPRESSION_DB[("📋 Suppression DB\nRedis bloom filter — hot layer\nPostgres — source of truth\nSync write: Redis first then Postgres\nRebuild from Postgres on Redis cold start\nMax stale tolerance: 30s\n[Compliance-Svc]")]
+      FAST_SUPPRESS["🚫 Fast-Path Bloom Filter\nIn-memory suppression check\nFor 2FA hot path\nFalse-positive safe\n[Ingress-Svc]"]
+    end
 
+    FAST["🏎️ High-Priority Ingestor\nBypasses standard limiter\nFor 2FA and transactional alerts\nDedicated thread pool\n[Ingress-Svc]"]
 
-%% =====================================================
-%% 4. CRM INTEGRATION DOMAIN
-%% =====================================================
+    L1_ENTRY --> AUTH
+    AUTH --> TOKEN_REVOKE --> CTX --> CELL_ROUTER
+    CELL_ROUTER -->|"Standard traffic"| DIST_QUOTA
+    CELL_ROUTER -->|"Priority: 2FA / Alerts"| FAST
+    DIST_QUOTA --> SUPPRESSION
+    SUPPRESSION <-->|"Lookup"| SUPPRESSION_DB
+    FAST --> FAST_SUPPRESS
+    FAST_SUPPRESS <-->|"Bloom filter lookup"| SUPPRESSION_DB
+  end
 
-subgraph CRM_DOMAIN["🔄 CRM Integration Domain"]
-    CRM_API["CRM Integration Service"]
-    IMPORT["Contact Import Processor"]
-    DEDUPE["Deduplication & Mapping Engine"]
-    CONTACT_DB["Contacts Write Database\n(Partitioned by tenant_id)"]
-end
+  %% =============================================
+  %% LAYER 2 — METADATA & IDENTITY
+  %% Owner: Data-Platform
+  %% =============================================
+  subgraph L2["🧠  LAYER 2 — Metadata & Identity    [Owner: Data-Platform]"]
+    direction TB
 
-APIGW --> CRM_API
-CRM_API --> IMPORT
-IMPORT --> DEDUPE
-DEDUPE --> CONTACT_DB
+    subgraph L2_SOR["  System of Record (SoR)  "]
+      direction LR
+      WRITE_ADMIT["🚧 Write Admission Controller\nRejects writes when PgBouncer queue over 80%\nReturns 503 with Retry-After header\nPrevents silent timeout and retry storms\nEnables idempotent client retry\n[Data-Svc]"]
+      PGBOUNCER["🔗 PgBouncer\nConnection pooler\nMax 10k client conns\nPrevents Postgres conn exhaustion\n[Data-Svc]"]
+      CRM[("🗄️ Citus / Postgres CRM\nSharded by tenant_id · 32 shards\nRead replicas per region\nPITR backups every 1h\nWrite ceiling: 200k TPS via sharding\nHigh-freq events go to append store\n[CRM-Svc]")]
+      APPEND_STORE[("⚡ Append-Only Event Store\nScyllaDB / DynamoDB\nHigh-frequency contact events\nOffloads CRM write path\nChange stream feeds APPEND_OUTBOX\nWrite: 500k+ TPS\n[Event-Store-Svc]")]
+      OUTBOX["📤 CRM CDC Outbox\nDebezium · at-least-once\nTx-bound outbox table\nStreams CRM changes to Silver Lane\n[Data-Sync-Svc]"]
+      APPEND_OUTBOX["📤 Append Store CDC\nChange stream connector\nStreams contact events to Silver Lane\nAt-least-once · schema-validated\n[Data-Sync-Svc]"]
+      SCHEMA_REG[("📋 Schema Registry\nConfluent · RF=3 · clustered\nAvro / Protobuf enforcement\nBreaking-change prevention\nCached schemas in all producers\nAll producers must register\n[Schema-Svc]")]
+      SCHEMA_MIG["🔧 Online Schema Migration\npt-online-schema-change / pgroll\nZero-downtime migrations\nRollback plan required per migration\n[Data-Svc]"]
+    end
 
+    subgraph L2_LOOKUP["  High-Concurrency Lookup  "]
+      direction LR
+      SLA_V{{"⏱️ Identity SLA Validator\nRejects if sync exceeds 50ms\nCompliance entities: hard reject on stale\nOffboarded tenants: hard reject on stale\nNon-critical: circuit-breaks to stale cache\nMax stale: 5 min for non-compliance paths\n[Identity-Svc]"}}
+      IDMAP[("🗺️ Global ID Map\nRedis · 3-replica cluster\nTTL: 5 min · LRU eviction\nContact and tenant resolution\nSLA under 50ms\n[Identity-Svc]")]
+    end
 
-%% =====================================================
-%% 5. CAMPAIGN AUTHORING DOMAIN
-%% =====================================================
+    subgraph L2_STATUS["  Campaign Status Store  "]
+      direction LR
+      STATUS_DB[("📊 Campaign Status DB\nPostgres · partitioned by tenant\nDurable authoritative state\nStatus: draft/running/done/failed\nDelivery counts per campaign\nQueried by campaign managers\n[Status-Svc]")]
+    end
 
-subgraph AUTHORING_DOMAIN["📝 Campaign Authoring Domain"]
-    CAMPAIGN_API["Campaign Service"]
-    TEMPLATE["Drag & Drop Template Builder"]
-    TEMPLATE_STORE["Template Version Store"]
-    PREVIEW["Render & Preview Service"]
-    SEGMENT["Segmentation Service"]
-    CONTACT_INDEX["Contact Search Index\n(Optimized for large queries)"]
-    SNAPSHOT["Audience Snapshot Store"]
-    OUTBOX["Outbox Table"]
-end
+    subgraph L2_PII["  PII and Compliance  "]
+      direction LR
+      PII_MASK["🔏 PII Masking Layer\nTokenization at write\nField-level encryption\nAudit log on access\n[Privacy-Svc]"]
+      ERASURE["🗑️ Erasure Processor\nGDPR right-to-delete\nPropagates to ALL tiers incl. COLD\nRate-limited: max 10k deletes/min\nDelete amplification protection\nSLA: 30d Hot/Warm · 90d Cold\n[Privacy-Svc]"]
+    end
 
-APIGW --> CAMPAIGN_API
+    ML_IN["🔁 ML Audience Feedback\nEngagement signals from L5\nUpdates segment scores\nAsync fire-and-forget\n[Async from Layer 5]"]
 
-CAMPAIGN_API --> TEMPLATE
-TEMPLATE --> TEMPLATE_STORE
-CAMPAIGN_API --> PREVIEW
+    WRITE_ADMIT --> PGBOUNCER --> CRM
+    CRM --> OUTBOX
+    APPEND_STORE --> APPEND_OUTBOX
+    CRM -->|"Stream updates"| SLA_V --> IDMAP
+    CRM <--> PII_MASK
+    CRM <-->|"Schema-on-write"| SCHEMA_REG
+    ERASURE -.->|"Rate-limited cascade"| CRM
+    ERASURE -.->|"Rate-limited cascade"| APPEND_STORE
+    ERASURE -.->|"Rate-limited cascade"| STATUS_DB
+    ML_IN -.->|"Async segment tuning"| CRM
+    OUTBOX <-->|"Schema validation"| SCHEMA_REG
+    APPEND_OUTBOX <-->|"Schema validation"| SCHEMA_REG
+    SCHEMA_MIG -.->|"Online migration"| CRM
+  end
 
-CAMPAIGN_API --> SEGMENT
-CONTACT_DB --> CONTACT_INDEX
-SEGMENT --> CONTACT_INDEX
-SEGMENT --> SNAPSHOT
+  %% =============================================
+  %% LAYER 3 — THE HIGHWAY (EVENT BUS)
+  %% Owner: Messaging-Infra
+  %% =============================================
+  subgraph L3["📡  LAYER 3 — The Highway (Event Bus)    [Owner: Messaging-Infra]"]
+    direction TB
 
-CAMPAIGN_API --> OUTBOX
+    subgraph L3_AUTH["  Topic Authorization  "]
+      direction LR
+      KAFKA_ACL["🔐 Kafka ACL / Authorization\nPer-topic ACL per service-account\nProducer scope: write-only\nConsumer scope: read-only\nTenant-ID header required in envelope\nConsumers validate tenant header\n[Kafka-Security-Svc]"]
+    end
 
+    subgraph L3_LANES["  Traffic Lanes  "]
+      direction LR
+      GOLD["🥇 Gold Lane\nKafka · RF=3 · 120 partitions\nRetention: 72h · ISR=2\nMsg envelope: tenant-id header\nSpill trigger: broker disk over 70%\nLag alert: over 50k msgs page SRE\nLow-latency · time-critical\n[Kafka-Cluster-A]"]
+      SILVER["🥈 Silver Lane\nKafka · RF=3 · 600 partitions\nRetention: 7d · ISR=2\nMsg envelope: tenant-id header\nSpill trigger: consumer lag over 1M\nLag alert: over 5M msgs page SRE\nHigh-throughput · bulk\n[Kafka-Cluster-B]"]
+    end
 
-%% =====================================================
-%% 6. EVENT STREAMING (KAFKA)
-%% =====================================================
+    subgraph L3_RESILIENCE["  Backpressure, Overflow and Recovery  "]
+      direction LR
+      GOLD_SPILL[("🥇☁️ Gold S3 Overflow\nSpill on Gold Lane saturation\nRetention: 72h · Re-entry to Gold\nPrevents Gold message loss\n[Storage-Svc]")]
+      SPILL[("☁️ Silver S3 / Iceberg Overflow\nSpill SLA: re-entry under 15min\nPartitioned by tenant and hour\nPrevents Kafka lag cascade\n[Storage-Svc]")]
+      REHYDRATE["💧 Hydration Worker\nThrottled re-entry\n500 msg/s max per tenant\nPrevents re-flood\n[Recovery-Svc]"]
+      DLQ["🏥 Dead Letter Queue\nTTL: 7 days\nAuto-replay after 30min\nMax 3 retries then page SRE\nDepth alert over 1000\n[Recovery-Svc]"]
+      REPLAY["▶️ DLQ Replay Service\nScheduled and manual trigger\nIdempotent re-injection\nGlobal replay rate cap: 5k msg/s total\nPer-tenant replay cap: 200 msg/s\nGold failures go to Gold Lane\nSilver failures go to Silver Lane\nRoot-cause gate: SRE must clear\nAudit trail per replay\n[Recovery-Svc]"]
+    end
 
-subgraph STREAMING_LAYER["📨 Event Streaming Layer"]
-    TOPIC_CAMPAIGN["Kafka Topic: campaign.details"]
-    TOPIC_AUDIENCE["Kafka Topic: campaign.audience"]
-    TOPIC_STATUS_RAW["Kafka Topic: delivery.status.raw"]
-    TOPIC_STATUS_NORM["Kafka Topic: delivery.status.normalized"]
-    TOPIC_ANALYTICS["Kafka Topic: analytics.events"]
-    KAFKA["Kafka Cluster\n(Partitioned by tenant_id)"]
-end
+    GOLD -->|"Saturation spill"| GOLD_SPILL
+    GOLD_SPILL -->|"Re-entry to Gold"| GOLD
+    SILVER -->|"Congestion spill"| SPILL
+    SPILL -->|"Throttled re-entry"| REHYDRATE --> SILVER
+    DLQ --> REPLAY
+    REPLAY -->|"Gold priority re-inject"| GOLD
+    REPLAY -->|"Silver bulk re-inject"| SILVER
+    KAFKA_ACL -.->|"Enforces on"| GOLD
+    KAFKA_ACL -.->|"Enforces on"| SILVER
+  end
 
-OUTBOX --> TOPIC_CAMPAIGN
-SNAPSHOT --> TOPIC_AUDIENCE
+  %% =============================================
+  %% LAYER 4 — THE MUSCLE (EXECUTION ENGINE)
+  %% Owner: Delivery-Eng
+  %% =============================================
+  subgraph L4["🚀  LAYER 4 — The Muscle (Execution Engine)    [Owner: Delivery-Eng]"]
+    direction TB
 
-TOPIC_CAMPAIGN --> KAFKA
-TOPIC_AUDIENCE --> KAFKA
+    subgraph L4_ORCH["  Orchestration  "]
+      direction LR
+      SAGA["🎼 Saga Orchestrator\nMulti-step campaign flows\nCompensating transactions\nState per message in Redis-State\nSaga TTL: 24h max lifetime\nIdempotent step execution\n[State-Svc]"]
+      CHOREO["📨 Event Consumer\nBulk stateless workers\nHPA: 10 to 500 pods\nPartition-to-pod ratio: 1.2x max\nConsumer group rebalance\n[Bulk-Svc]"]
+      SEND_SCHED["⏰ Send-Time Optimizer\nTimezone-aware scheduling\nStaggered burst: max N/s per tenant\nTenant-aware canary routing\nRoutes through CB and TB\nSend-window config per campaign\n[Schedule-Svc]"]
+    end
 
+    subgraph L4_STATE["  Resilient State — 3 Isolated Redis Clusters  "]
+      direction LR
+      LCACHE["⚡ Local LRU Cache\nIn-process sub-ms\nMax 10k entries per worker\nReduces Redis pressure\n[Worker-Node]"]
+      REDIS_IDEM[("🔴 Redis — Idempotency\n3-shard · 3-replica · cross-AZ\nTTL: 24h dedup window\nFail-open on shard loss with audit log\nDuplicate risk bounded to shard keyspace\nIsolated failure domain\n[Cache-Idem-Svc]")]
+      REDIS_STATE[("🟠 Redis — Delivery State\n3-shard · 3-replica · cross-AZ\nSaga step tracking\nOn region failover: rebuild from STATUS_DB\nIsolated failure domain\n[Cache-State-Svc]")]
+      REDIS_RATE[("🟡 Redis — Rate / Token Buckets\n3-shard · 3-replica · cross-AZ\nPer-provider token buckets\nOn region failover: reset to conservative defaults\nIsolated failure domain\n[Cache-Rate-Svc]")]
+    end
 
-%% =====================================================
-%% 7. DELIVERY DOMAIN (DATA PLANE)
-%% =====================================================
+    subgraph L4_PROV["  Provider Capacity Management  "]
+      direction LR
+      PROV_BUDGET["📊 Provider Budget Manager\nTracks rate limits per provider per tenant\nPer-tenant fairness during mass failover\nFallback quota: 60% of primary limit\nCost alert: fallback spend over 2x primary\nPrevents single-tenant monopoly on fallback\n[Delivery-Svc]"]
+    end
 
-subgraph DELIVERY_DOMAIN["🚀 Delivery Domain"]
-    ORCHESTRATOR["Delivery Orchestrator (Saga)"]
-    COMPOSER["Message Composer"]
-    WORKERS["Delivery Workers"]
-    IDEMPOTENCY["Idempotency Store"]
-    RATE_LIMIT["Per-Tenant Rate Limiter"]
-    RETRY["Retry Engine"]
-    CIRCUIT["Circuit Breaker"]
-    DLQ["Dead Letter Queue"]
-    PROVIDER_ADAPTER["Provider Adapter Layer"]
-    DELIVERY_STORE["Delivery Event Store\n(State Machine)"]
-end
+    subgraph L4_WORKERS["  Channel Delivery Workers  (HPA: auto-scaled)  "]
+      direction LR
+      WEMAIL["📧 Email Pool\nSES / SendGrid / Mailgun\nSecondary provider fallback\nFallback governed by PROV_BUDGET\nDKIM signing\n[Mail-Svc]"]
+      WSMS["💬 SMS / WhatsApp\nTwilio / Vonage\nSecondary provider fallback\nFallback governed by PROV_BUDGET\nDelivery receipt loop\n[Comm-Svc]"]
+      WPUSH["🔔 Push Notifications\nFCM / APNs\nToken refresh on 410\n[Notify-Svc]"]
+      WSOCIAL["📱 Social Channels\nInstagram · Facebook\nLinkedIn · OAuth token mgmt\n[Social-Svc]"]
+    end
 
-KAFKA --> ORCHESTRATOR
-ORCHESTRATOR --> COMPOSER
-COMPOSER --> WORKERS
+    subgraph L4_FAULT["  Provider Protection and Delivery Assurance  "]
+      direction LR
+      CB["⚙️ Smart Circuit Breaker\nHalf-open probe every 30s\nFallback routed through PROV_BUDGET\nState: closed/open/half-open\n[Resiliency-Svc]"]
+      TB["🪙 Token Bucket\nPer-provider rate limiting\nRetry with exponential backoff\nPerm-fail goes to DLQ\n[Traffic-Svc]"]
+      RECEIPT["📬 Delivery Receipt Reconciler\nProvider webhook ingestion\nStatus: sent/delivered/bounced\nHard bounce feeds SUPPRESSION_DB\nUpdates STATUS_DB per campaign\nSLA: reconcile under 5min\n[Delivery-Svc]"]
+      RECEIPT_SWEEP["🔍 Receipt Timeout Sweep\nScheduled every 10min\nFinds messages with no receipt over 15min\nQueries provider API for status\nForces reconcile or sends to DLQ\n[Delivery-Svc]"]
+    end
 
-WORKERS --> IDEMPOTENCY
-WORKERS --> RATE_LIMIT
-WORKERS --> RETRY
-WORKERS --> CIRCUIT
-WORKERS --> PROVIDER_ADAPTER
-WORKERS --> DELIVERY_STORE
-WORKERS --> DLQ
+    subgraph L4_DEPLOY["  Deployment Safety — All Critical Services  "]
+      direction LR
+      CANARY["🐦 Canary Controller\nTenant-aware routing — not global 5%\nSmall tenants only in first wave\nTraffic split: 5% then 25% then 100%\nAuto-rollback on error spike\nCovers schema registry deploys\n[Deploy-Svc]"]
+      LOAD_TEST["🔬 Load Test Gate\nk6 / Gatling shadow traffic\nMust pass at 2x target TPS\nBlocks promotion to prod\nRun before each scale milestone\n[QE-Svc]"]
+    end
 
+    L4_ORCH --> LCACHE
+    LCACHE --> REDIS_IDEM
+    LCACHE --> REDIS_STATE
+    LCACHE --> REDIS_RATE
+    REDIS_STATE --> L4_WORKERS
+    REDIS_IDEM -.->|"Dedup check — fail-open with audit"| L4_WORKERS
+    REDIS_RATE --> TB
+    SEND_SCHED --> CB
+    PROV_BUDGET --> CB
+    L4_WORKERS --> CB --> TB
+    TB -->|"Retry / Success"| L4_WORKERS
+    TB -->|"Circuit open / Perm-fail"| DLQ
+    L4_WORKERS -->|"Provider webhooks"| RECEIPT
+    RECEIPT_SWEEP -->|"Force-reconcile missing receipts"| RECEIPT
+    RECEIPT_SWEEP -.->|"Unresolvable goes to DLQ"| DLQ
+  end
 
-%% =====================================================
-%% 8. EXTERNAL CHANNEL PROVIDERS
-%% =====================================================
+  %% =============================================
+  %% LAYER 5 — THE MEMORY (ANALYTICS)
+  %% Owner: Analytics-Eng
+  %% =============================================
+  subgraph L5["📊  LAYER 5 — The Memory (Analytics and Intelligence)    [Owner: Analytics-Eng]"]
+    direction TB
 
-subgraph CHANNEL_PROVIDERS["📡 External Channel Providers"]
-    EMAIL["Email Provider"]
-    SMS["SMS Provider"]
-    WHATSAPP["WhatsApp Business API"]
-    SOCIAL["Instagram / Facebook / LinkedIn APIs"]
-    PUSH["Push Notification Service"]
-end
+    subgraph L5_STREAM["  Stream Processing  "]
+      direction LR
+      FLINK["⚡ Flink Stream Processor\nExactly-once semantics\nWatermark: 30s late arrival\nCheckpoint every 60s to S3\nState backend: RocksDB incremental\nMax state size per job: 500GB\nCheckpoint timeout: 120s — alert if exceeded\nOffset recovery: replay from Kafka\nTenant-partitioned jobs\n[Stream-Svc]"]
+      PII_STRIP["🔏 PII Anonymizer\nStrips PII before analytics write\nTokenized contact IDs only\nGDPR compliant\n[Privacy-Svc]"]
+    end
 
-PROVIDER_ADAPTER --> EMAIL
-PROVIDER_ADAPTER --> SMS
-PROVIDER_ADAPTER --> WHATSAPP
-PROVIDER_ADAPTER --> SOCIAL
-PROVIDER_ADAPTER --> PUSH
+    subgraph L5_STORE["  Storage Tiers  "]
+      direction LR
+      HOT[("🔥 ClickHouse — Hot Tier\n8-shard · RF=3\nMergeTree · TTL: 30 days\nTenant-partitioned\nWrite: 2M rows/s\nPost-region-failover: rebuild from WARM\n[Insight-DB]")]
+      WARM[("❄️ S3 Iceberg — Warm Tier\nBatch ETL every 6h\nParquet · Z-order by tenant\nRetention: 2 years\nMulti-region inherently\n[Datalake]")]
+      COLD[("🧊 Glacier — Cold Tier\nAnnual archival\nCompliance retention: 7 years\n[Archive-Svc]")]
+    end
 
+    subgraph L5_ML["  ML Intelligence  "]
+      direction LR
+      MLGW["🤖 ML Feedback Gateway\nFast-path from Flink\nModel: engagement scoring\nAsync to Layer 2 segments\n[ML-Svc]"]
+      ML_BUFFER[("🗄️ ML Signal Buffer\nKafka topic · TTL 1h\nAbsorbs signals when ML-Svc down\nAlert if drop rate over 5% in 10min\nPrevents silent signal loss\n[ML-Svc]")]
+    end
 
-%% =====================================================
-%% 9. STATUS INGESTION
-%% =====================================================
+    FLINK --> PII_STRIP --> HOT
+    FLINK --> MLGW
+    MLGW --> ML_BUFFER
+    ML_BUFFER -.->|"Drain when ML-Svc recovers"| MLGW
+    HOT -.->|"Batch ETL every 6h"| WARM
+    WARM -.->|"Annual archival"| COLD
+  end
 
-subgraph STATUS_INGESTION["📥 Delivery Status Ingestion"]
-    WEBHOOK["Webhook Gateway"]
-    VALIDATOR["Signature Validator"]
-    NORMALIZER["Status Normalizer"]
-end
+  %% =============================================
+  %% LAYER 6 — OBSERVABILITY AND DR
+  %% Owner: SRE-Team
+  %% =============================================
+  subgraph L6["📡  LAYER 6 — Observability and DR    [Owner: SRE-Team]"]
+    direction TB
 
-EMAIL --> WEBHOOK
-SMS --> WEBHOOK
-WHATSAPP --> WEBHOOK
-SOCIAL --> WEBHOOK
-PUSH --> WEBHOOK
+    subgraph L6_OBS["  Observability Stack  "]
+      direction LR
+      TRACE["🔍 Distributed Tracing\nJaeger / Tempo\nTail-based sampling: 100% errors\n1% sampled for healthy paths\nTrace-ID on every event\n[Observability-Svc]"]
+      METRICS["📈 Metrics and Alerting\nPrometheus + Grafana\nKafka lag · error rates\nDLQ depth · latency p99\nProvider fallback cost rate\nReceipt timeout rate\n[Observability-Svc]"]
+      LOGS["📋 Centralized Logging\nElastic / Loki\nStructured JSON logs\nCorrelated by trace-ID\n[Observability-Svc]"]
+    end
 
-WEBHOOK --> VALIDATOR --> NORMALIZER
-NORMALIZER --> TOPIC_STATUS_RAW
-TOPIC_STATUS_RAW --> KAFKA
-KAFKA --> TOPIC_STATUS_NORM
-TOPIC_STATUS_NORM --> DELIVERY_STORE
+    subgraph L6_SLA["  SLA Monitoring  "]
+      direction LR
+      MON{{"🟢 SLA Monitor\nKafka lag thresholds enforced\nCircuit states · DLQ depth over 1000\nWorker error rates · p99 latency\nProvider fallback rate and cost\nML drop rate · Receipt sweep misses\nFlink checkpoint latency\n[SRE-Team]"}}
+      ALERT["🔔 Alert and Throttle\nPagerDuty escalation\nRunbook links in every alert\nAutomated backpressure to DIST_QUOTA\nThreshold-based — not manual\n[SRE-Team]"]
+      RUNBOOK["📖 Runbooks\nDLQ overflow · Circuit reset\nKafka rebalance · Redis failover\nFlink offset recovery\nCRM migration rollback\nRedis cold-start rebuild sequence\nClickHouse rebuild from WARM\n[SRE-Team]"]
+    end
 
+    subgraph L6_DR["  Disaster Recovery  "]
+      direction LR
+      DR["🔄 Multi-Region DR\nActive-passive · 2 regions\nRPO: 1 hour · RTO: 15 min\nCross-region Kafka MirrorMaker 2\nRedis rebuilt from Postgres on failover\nRate buckets reset to conservative defaults\nClickHouse rebuilt from WARM tier\nAuto-failover via Route53\n[Infra-Svc]"]
+      DR_DRILL["🧪 DR Drill Program\nFull failover drill: quarterly\nChaos injection: monthly\nGame day: bi-annually\nResults tracked in runbook\n[SRE-Team]"]
+    end
 
-%% =====================================================
-%% 10. TRACKING SYSTEM
-%% =====================================================
+    MON --> ALERT --> RUNBOOK
+    DR_DRILL -.->|"Validates"| DR
+  end
 
-subgraph TRACKING_LAYER["🔍 Tracking Layer"]
-    REDIRECT["Click Redirect Service"]
-    PIXEL["Open Tracking Pixel"]
-end
+  %% =============================================
+  %% INTER-LAYER CONNECTIONS
+  %% =============================================
 
-REDIRECT --> TOPIC_ANALYTICS
-PIXEL --> TOPIC_ANALYTICS
+  %% L0 → L1
+  APIGW -->|"Routed clean traffic"| L1_ENTRY
+  SECRETS -.->|"Sidecar cred injection"| AUTH
+  SECRETS -.->|"Sidecar cred injection"| CRM
+  SECRETS -.->|"Sidecar cred injection"| SAGA
+  SECRETS -.->|"Sidecar cred injection"| FLINK
+  MESH -.->|"East-west mTLS policy"| L1
+  MESH -.->|"East-west mTLS policy"| L4
+  COMPLIANCE -.->|"Opt-out / erasure signals"| SUPPRESSION_DB
+  OPTOUT_WH -->|"Verified real-time unsubscribes"| SUPPRESSION_DB
+  DEGRADE_POL -.->|"Priority tiers enforced by"| DIST_QUOTA
 
+  %% L1 → L2
+  FAST_SUPPRESS -->|"Passed suppression check"| GOLD
+  SUPPRESSION --> CAMP_API["🗂️ Campaign and Segment API\nAudience selection · Segmentation\nTemplate configs · Campaign CRUD\n[Campaign-Svc]"]
+  CAMP_API <-->|"Read/Write campaign and contact data"| WRITE_ADMIT
 
-%% =====================================================
-%% 11. ANALYTICS & REPORTING
-%% =====================================================
+  %% L1 hot path → L3
+  FAST -->|"Direct to Gold Lane"| GOLD
 
-subgraph ANALYTICS_DOMAIN["📊 Analytics & Reporting"]
-    STREAM_PROC["Stream Processor"]
-    AGG_DB["Analytics Aggregation DB\n(Partitioned by tenant_id)"]
-    REPORT_API["Reporting API"]
-    INTELLIGENCE["Campaign Intelligence Engine"]
-end
+  %% L2 → L3
+  OUTBOX -.->|"Async CRM CDC stream"| SILVER
+  APPEND_OUTBOX -.->|"Async append-store stream"| SILVER
+  SCHEMA_REG -.->|"Producer schema enforcement"| GOLD
+  SCHEMA_REG -.->|"Producer schema enforcement"| SILVER
+  SCHEMA_REG -.->|"Producer schema enforcement"| OUTBOX
+  SCHEMA_REG -.->|"Producer schema enforcement"| APPEND_OUTBOX
 
-KAFKA --> STREAM_PROC
-STREAM_PROC --> AGG_DB
-AGG_DB --> REPORT_API
-AGG_DB --> INTELLIGENCE
-REPORT_API --> APIGW
+  %% L3 → L4
+  GOLD -->|"High-priority events"| SAGA
+  SILVER -->|"Bulk campaign events"| CHOREO
 
+  %% L4 → L2 (status and bounce write-back)
+  RECEIPT -->|"Delivery counts and status"| STATUS_DB
+  RECEIPT -->|"Hard bounce registration"| SUPPRESSION_DB
+  REDIS_STATE -.->|"Saga state rebuild source"| STATUS_DB
 
-%% =====================================================
-%% 12. OBSERVABILITY
-%% =====================================================
+  %% L4 → L5
+  L4_WORKERS -->|"Engagement events"| FLINK
+  RECEIPT -->|"Delivery status events"| FLINK
 
-subgraph OBSERVABILITY["📈 Observability"]
-    METRICS["Metrics"]
-    LOGS["Centralized Logs"]
-    TRACING["Distributed Tracing"]
-    ALERTS["Alerting System"]
-end
+  %% L5 → L1 (live dashboard)
+  FLINK -->|"Live stats feed"| UI
 
-WORKERS --> LOGS
-WORKERS --> TRACING
-KAFKA --> METRICS
-METRICS --> ALERTS
-LOGS --> ALERTS
+  %% L5 → L2 (ML feedback)
+  ML_BUFFER -.->|"Async audience tuning"| ML_IN
+
+  %% GDPR erasure cascade — rate-limited to prevent cluster shock
+  ERASURE -.->|"Rate-limited erasure"| HOT
+  ERASURE -.->|"Rate-limited erasure"| WARM
+  ERASURE -.->|"Rate-limited erasure SLA 90d"| COLD
+  ERASURE -.->|"Rate-limited erasure"| SUPPRESSION_DB
+
+  %% Observability wires
+  L1 -.->|"Traces + Metrics + Logs"| TRACE
+  L2 -.->|"Traces + Metrics + Logs"| TRACE
+  L3 -.->|"Kafka lag · throughput"| METRICS
+  L4 -.->|"Worker errors · circuit state · provider cost"| METRICS
+  L5 -.->|"Query latency · ETL lag · ML drop rate · checkpoint latency"| METRICS
+  TRACE & METRICS & LOGS --> MON
+  ALERT -.->|"Automated backpressure — threshold-triggered"| DIST_QUOTA
+
+  %% DR
+  L2 -.->|"Cross-region replication"| DR
+  L3 -.->|"Kafka MirrorMaker 2"| DR
+
+  %% Deployment
+  CANARY -.->|"Tenant-aware rollout"| L4_WORKERS
+  CANARY -.->|"Tenant-aware rollout"| SAGA
+  CANARY -.->|"Tenant-aware rollout"| FLINK
+  LOAD_TEST -.->|"Gate: must pass before scale milestone"| CANARY
+
+  %% =============================================
+  %% STYLES
+  %% =============================================
+
+  classDef gold     fill:#1e1600,stroke:#f5c842,stroke-width:2px,color:#f5c842
+  classDef blue     fill:#071524,stroke:#4d9fff,stroke-width:1.5px,color:#9ecfff
+  classDef green    fill:#07180e,stroke:#3ddc84,stroke-width:1.5px,color:#7eedb0
+  classDef red      fill:#180707,stroke:#ff5757,stroke-width:1.5px,color:#ff9a9a
+  classDef purple   fill:#120a1e,stroke:#b57fff,stroke-width:1.5px,color:#d4b0ff
+  classDef orange   fill:#180d04,stroke:#ff9340,stroke-width:1.5px,color:#ffbe8a
+  classDef teal     fill:#071818,stroke:#3dd6d0,stroke-width:1.5px,color:#7eecea
+  classDef decision fill:#0d0f14,stroke:#f5c842,stroke-width:1.5px,color:#f5c842
+  classDef pink     fill:#1a0714,stroke:#ff6eb4,stroke-width:1.5px,color:#ffadd6
+  classDef warn     fill:#1a0e00,stroke:#ff9340,stroke-width:2px,color:#ffbe8a
+
+  class CDN,TLS,DDOS_L7,WAF_L7,APIGW,API_LIFECYCLE blue
+  class MESH teal
+  class DEGRADE_POL warn
+  class SECRETS,COMPLIANCE,OPTOUT_WH pink
+  class UI,API,AUTH,CTX,DIST_QUOTA,CAMP_API blue
+  class TOKEN_REVOKE red
+  class FAST gold
+  class CELL_ROUTER decision
+  class SUPPRESSION,FAST_SUPPRESS red
+  class SUPPRESSION_DB red
+  class WRITE_ADMIT warn
+  class PGBOUNCER,CRM,IDMAP,OUTBOX,APPEND_OUTBOX,ML_IN,SCHEMA_REG,APPEND_STORE purple
+  class STATUS_DB purple
+  class SCHEMA_MIG teal
+  class PII_MASK,ERASURE pink
+  class SLA_V decision
+  class GOLD gold
+  class SILVER,SPILL,REHYDRATE green
+  class GOLD_SPILL gold
+  class KAFKA_ACL pink
+  class DLQ,REPLAY red
+  class SAGA,CHOREO,SEND_SCHED,LCACHE orange
+  class REDIS_IDEM,REDIS_STATE,REDIS_RATE orange
+  class PROV_BUDGET warn
+  class WEMAIL,WSMS,WPUSH,WSOCIAL orange
+  class CB,TB,RECEIPT,RECEIPT_SWEEP orange
+  class CANARY,LOAD_TEST teal
+  class FLINK,PII_STRIP,HOT,WARM,COLD green
+  class MLGW,ML_BUFFER green
+  class TRACE,METRICS,LOGS,RUNBOOK teal
+  class MON,ALERT,DR,DR_DRILL teal
