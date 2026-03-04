@@ -25,13 +25,17 @@ Each decision below is repeated as: *What was chosen → Why → Pros/Cons → W
 
 ```mermaid
 flowchart LR
-  L0[Layer 0 — Global Network & Security] --> L1[Layer 1 — Ingress & Identity]
-  L1 --> L2[Layer 2 — Metadata & System of Record]
-  L2 --> L3[Layer 3 — Event Bus (Gold / Silver)]
-  L3 --> L4[Layer 4 — Execution Engine (Workers / Sagas)]
-  L4 --> L5[Layer 5 — Analytics & Memory]
-  L5 --> L6[Layer 6 — Observability & DR]
-  L6 -.-> L1 & L3 & L4
+
+L0["Layer 0 - Global Network and Security"] --> L1["Layer 1 - Ingress and Identity"]
+L1 --> L2["Layer 2 - Metadata and System of Record"]
+L2 --> L3["Layer 3 - Event Bus Gold and Silver"]
+L3 --> L4["Layer 4 - Execution Engine Workers and Sagas"]
+L4 --> L5["Layer 5 - Analytics and Memory"]
+L5 --> L6["Layer 6 - Observability and Disaster Recovery"]
+
+L6 -.-> L1
+L6 -.-> L3
+L6 -.-> L4
 ```
 
 ---
@@ -454,19 +458,29 @@ Fast detection + automated backpressure, predictable failover semantics, runbook
 
 ```mermaid
 flowchart TB
-  CDN[CDN / Anycast] --> APIGW[API Gateway]
-  APIGW --> AUTH[OIDC / RBAC]
-  AUTH --> CTX[Tenant Context Injector]
-  CTX --> CELL[Cell Router]
-  CELL --> GOLD[Gold Kafka (critical)]
-  CELL --> SILVER[Silver Kafka (bulk)]
-  GOLD --> SAGA[Saga Orchestrator]
-  SILVER --> CHOREO[Bulk Workers]
-  SAGA & CHOREO --> FLINK[Stream Processor]
-  FLINK --> HOT[ClickHouse Hot]
-  FLINK --> WARM[S3 Iceberg Warm]
-  HOT --> COLD[Glacier Cold]
-  OBS[Observability Stack] -.-> APIGW & GOLD & SAGA & FLINK
+
+CDN["CDN - Anycast"] --> APIGW["API Gateway"]
+APIGW --> AUTH["OIDC and RBAC"]
+AUTH --> CTX["Tenant Context Injector"]
+CTX --> CELL["Cell Router"]
+
+CELL --> GOLD["Gold Kafka Critical"]
+CELL --> SILVER["Silver Kafka Bulk"]
+
+GOLD --> SAGA["Saga Orchestrator"]
+SILVER --> CHOREO["Bulk Workers"]
+
+SAGA --> FLINK["Stream Processor"]
+CHOREO --> FLINK
+
+FLINK --> HOT["ClickHouse Hot Storage"]
+FLINK --> WARM["S3 Iceberg Warm Storage"]
+HOT --> COLD["Glacier Cold Storage"]
+
+OBS["Observability Stack"] -.-> APIGW
+OBS -.-> GOLD
+OBS -.-> SAGA
+OBS -.-> FLINK
 ```
 
 ---
