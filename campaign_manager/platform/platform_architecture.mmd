@@ -68,7 +68,7 @@ flowchart TB
     subgraph L1_SUPPRESS["  Suppression  "]
       direction LR
       SUPPRESSION["🚫 Suppression Check\nUnsubscribe · blocklist\nHard bounce registry\nGDPR erasure enforcement\nFail-open with audit log on DB outage\n[Compliance-Svc]"]
-      SUPPRESSION_DB[("📋 Suppression DB\nRedis bloom filter — hot layer\nPostgres — source of truth\nSync write: Redis first then Postgres\nRebuild from Postgres on Redis cold start\nMax stale tolerance: 30s\n[Compliance-Svc]")]
+      SUPPRESSION_DB[("📋 Suppression DB\nPostgres — compliance gate and source of truth\nRedis bloom filter — performance hint only (not compliance gate)\nBloom is append-only: unsubscribe always forces Postgres lookup\nSync: Postgres → Redis on write · not reverse\nRebuild from Postgres on Redis cold start · max stale 30s\n[Compliance-Svc]")]
       FAST_SUPPRESS["🚫 Fast-Path Bloom Filter\nIn-memory suppression check\nFor 2FA hot path\nFalse-positive safe\n[Ingress-Svc]"]
     end
 
@@ -96,7 +96,7 @@ flowchart TB
       WRITE_ADMIT["🚧 Write Admission Controller\nRejects writes when PgBouncer queue over 80%\nReturns 503 with Retry-After header\nPrevents silent timeout and retry storms\nEnables idempotent client retry\n[Data-Svc]"]
       PGBOUNCER["🔗 PgBouncer\nConnection pooler\nMax 10k client conns\nPrevents Postgres conn exhaustion\n[Data-Svc]"]
       CRM[("🗄️ Citus / Postgres CRM\nSharded by tenant_id · 32 shards\nRead replicas per region\nPITR backups every 1h\nWrite ceiling: 200k TPS via sharding\nHigh-freq events go to append store\n[CRM-Svc]")]
-      APPEND_STORE[("⚡ Append-Only Event Store\nScyllaDB / DynamoDB\nHigh-frequency contact events\nOffloads CRM write path\nChange stream feeds APPEND_OUTBOX\nWrite: 500k+ TPS\n[Event-Store-Svc]")]
+      APPEND_STORE[("⚡ Append-Only Event Store\nGoogle Bigtable\nHigh-frequency contact events\nOffloads CRM write path\nChange stream feeds APPEND_OUTBOX\nWrite: 500k+ TPS\n[Event-Store-Svc]")]
       OUTBOX["📤 CRM CDC Outbox\nDebezium · at-least-once\nTx-bound outbox table\nStreams CRM changes to Silver Lane\n[Data-Sync-Svc]"]
       APPEND_OUTBOX["📤 Append Store CDC\nChange stream connector\nStreams contact events to Silver Lane\nAt-least-once · schema-validated\n[Data-Sync-Svc]"]
       SCHEMA_REG[("📋 Schema Registry\nConfluent · RF=3 · clustered\nAvro / Protobuf enforcement\nBreaking-change prevention\nCached schemas in all producers\nAll producers must register\n[Schema-Svc]")]
@@ -160,7 +160,7 @@ flowchart TB
       GOLD_SPILL[("🥇☁️ Gold S3 Overflow\nSpill on Gold Lane saturation\nRetention: 72h · Re-entry to Gold\nPrevents Gold message loss\n[Storage-Svc]")]
       SPILL[("☁️ Silver S3 / Iceberg Overflow\nSpill SLA: re-entry under 15min\nPartitioned by tenant and hour\nPrevents Kafka lag cascade\n[Storage-Svc]")]
       REHYDRATE["💧 Hydration Worker\nThrottled re-entry\n500 msg/s max per tenant\nPrevents re-flood\n[Recovery-Svc]"]
-      DLQ["🏥 Dead Letter Queue\nTTL: 7 days\nAuto-replay after 30min\nMax 3 retries then page SRE\nDepth alert over 1000\n[Recovery-Svc]"]
+      DLQ["🏥 Dead Letter Queue\nTTL: 7 days\nMax 3 retries then page SRE\nDepth alert over 1000\nNo auto-replay — root-cause gate required\nSRE must clear gate before replay starts\n[Recovery-Svc]"]
       REPLAY["▶️ DLQ Replay Service\nScheduled and manual trigger\nIdempotent re-injection\nGlobal replay rate cap: 5k msg/s total\nPer-tenant replay cap: 200 msg/s\nGold failures go to Gold Lane\nSilver failures go to Silver Lane\nRoot-cause gate: SRE must clear\nAudit trail per replay\n[Recovery-Svc]"]
     end
 
@@ -192,7 +192,7 @@ flowchart TB
     subgraph L4_STATE["  Resilient State — 3 Isolated Redis Clusters  "]
       direction LR
       LCACHE["⚡ Local LRU Cache\nIn-process sub-ms\nMax 10k entries per worker\nReduces Redis pressure\n[Worker-Node]"]
-      REDIS_IDEM[("🔴 Redis — Idempotency\n3-shard · 3-replica · cross-AZ\nTTL: 24h dedup window\nFail-open on shard loss with audit log\nDuplicate risk bounded to shard keyspace\nIsolated failure domain\n[Cache-Idem-Svc]")]
+      REDIS_IDEM[("🔴 Tiered Dedup\nL1: In-process LRU per worker · ~512MB · sub-ms\nL2: Counting Bloom Filter · ~72GB · 0.1% FPR · supports TTL\nL3: Redis confirmed dupes only · ~14GB (99% smaller than full-key store)\nFail-open at L3: miss → allow send + audit log\nNaive full-key Redis = 1.4TB at 10B events/day — eviction risk\n[Cache-Idem-Svc]")]
       REDIS_STATE[("🟠 Redis — Delivery State\n3-shard · 3-replica · cross-AZ\nSaga step tracking\nOn region failover: rebuild from STATUS_DB\nIsolated failure domain\n[Cache-State-Svc]")]
       REDIS_RATE[("🟡 Redis — Rate / Token Buckets\n3-shard · 3-replica · cross-AZ\nPer-provider token buckets\nOn region failover: reset to conservative defaults\nIsolated failure domain\n[Cache-Rate-Svc]")]
     end
