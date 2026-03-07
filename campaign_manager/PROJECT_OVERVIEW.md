@@ -138,7 +138,7 @@ These are the features a user of this platform would actually interact with, der
 | Metric | Target |
 |---|---|
 | Uptime | 99.999% (≤ 5.26 minutes downtime per year) |
-| Recovery Time Objective | 15 minutes (full region failover) |
+| Recovery Time Objective | 15 minutes if DR dedup shadow-warm lag < 30s · 30 minutes if shadow-warm lagged |
 | Recovery Point Objective | 1 hour (maximum data loss window) |
 | CRM write throughput | 200,000 TPS (32-shard Citus cluster) |
 | Event store write throughput | 500,000+ TPS (Google Bigtable) |
@@ -156,11 +156,11 @@ These are the features a user of this platform would actually interact with, der
 
 The platform runs across three cloud providers and a global edge network, chosen for the specific strengths of each:
 
-**Cloudflare** handles all global edge traffic — CDN, DDoS absorption at L3/L4 and L7, WAF, bot management — at 200+ points of presence worldwide. Traffic is absorbed and filtered before it reaches any origin infrastructure.
+**Cloudflare** is the sole edge security provider — CDN, DDoS absorption at L3/L4 and L7, WAF, bot management, and TLS 1.3 termination — across 200+ points of presence worldwide. Cloudflare Enterprise covers all threat classes; no secondary DDoS provider is used. Duplicating DDoS protection at both CF and AWS layer adds cost and latency without additional protection. Traffic is fully absorbed and filtered before reaching any origin infrastructure, with a measured edge overhead of ~2ms p99.
 
 **AWS** (us-east-1 primary, us-west-2 standby) runs the ingress and execution layers — EKS delivery clusters, ElastiCache Redis state clusters, S3 data overflow and Iceberg datalake, Glacier cold archive, Route53 failover orchestration, and all audit and compliance tooling.
 
-**GCP** (us-central1 primary, europe-west4 replica) owns the data layer — Citus/AlloyDB as the CRM, Bigtable as the high-frequency event store, Memorystore for identity caching, Cloud Spanner for campaign status, Dataflow/Flink for stream analytics, ClickHouse Cloud for hot tier analytics, and Vertex AI for ML audience scoring.
+**GCP** (us-central1 primary, europe-west4 replica) owns the data layer and the Campaign API — Citus/AlloyDB as the CRM, Bigtable as the high-frequency event store, Memorystore for identity caching, Cloud Spanner for campaign status, Dataflow/Flink for stream analytics, ClickHouse Cloud for hot tier analytics, Vertex AI for ML audience scoring, and the Campaign API co-located here to eliminate cross-cloud synchronous write latency on the campaign path.
 
 **Azure** contributes Purview for data governance and PII lineage, Entra ID for employee identity and privileged access management, and the compliance reporting layer.
 
