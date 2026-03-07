@@ -1,0 +1,595 @@
+flowchart TB
+
+  %% ==========================================================
+  %% GLOBAL EDGE — Cloudflare ONLY for DDoS+WAF (Shield removed)
+  %% Decision: Cloudflare handles ALL edge security (DDoS L3/L4/L7,
+  %% WAF, bot mgmt, TLS termination, rate rules). AWS Shield removed —
+  %% redundant with CF Enterprise and doubles the per-request cost.
+  %% Latency budget (measured, not aspirational):
+  %%   CF PoP → TLS termination : ~2ms (session reuse; no per-req handshake)
+  %%   NLB TCP passthrough       : <1ms (no TLS hop — CF handles termination)
+  %%   APIGW payload validation  : ~5ms
+  %%   Cell Router tenant-route  : ~1ms
+  %%   Total edge overhead p99   : ~9ms
+  %% Istio mTLS east-west: session-level mutual auth, NOT per-request TLS.
+  %% Re-handshake only on pod restart. Steady-state overhead: ~0.5ms/hop.
+  %% ==========================================================
+  subgraph EDGE["🌐  GLOBAL EDGE — Cloudflare Enterprise · ACM/NLB TCP passthrough"]
+    direction LR
+
+    subgraph CF_ZONE["  Cloudflare — Single Security Plane  "]
+      direction LR
+      CDN["🌍 Cloudflare CDN\nAnycast · 200+ PoPs\nDDoS L3/L4/L7 — sole provider\nTLS 1.3 termination at PoP\nNo AWS Shield — CF Enterprise covers all\nEdge latency: ~2ms p99\n[CF Enterprise]"]
+      WAF["🛡️ Cloudflare WAF\nOWASP ruleset\nBot mgmt · Geo-block\nRate rules · Credential-stuffing detection\nSingle WAF plane — no double-inspection\n[CF Enterprise]"]
+    end
+
+    subgraph AWS_ZONE["  AWS Ingress  "]
+      direction LR
+      ACM["🔒 AWS NLB — TCP passthrough\nNo TLS re-termination (CF already terminated)\nCert managed by CF · NLB = L4 only\nNo mTLS at edge — east-west only\nPassthrough latency: <1ms\n[AWS NLB]"]
+      APIGW["🔌 AWS API Gateway v2\nRoute versioning /v1 /v2\nPayload validation · Auth forwarding\nLatency: ~5ms\n[AWS]"]
+      API_LIFECYCLE["📋 API Lifecycle Mgr\nSunset headers RFC 8594\nDeprecation notices\nBreaking-change policy\n[Edge-Svc]"]
+      SECRETS["🔑 AWS Secrets Manager\n+ HashiCorp Vault\nAuto-rotation 30d\nSidecar injection all pods\n[AWS]"]
+    end
+
+    subgraph COMPLIANCE_ZONE["  Compliance & Opt-Out  "]
+      direction LR
+      OPTOUT_WH["📩 Unsubscribe Webhook\nHMAC-SHA256 per provider\nIP allowlist enforced\nIdempotency key per event\nRFC 8058 one-click\n[Compliance-Svc]"]
+      COMPLIANCE["⚖️ Compliance Gateway\nGDPR erasure signals\nCAN-SPAM opt-out\nDMARC/SPF/DKIM\nPII classifier\n[Legal-Svc]"]
+    end
+
+    subgraph POLICY_ZONE["  Platform Policy  "]
+      direction LR
+      DEGRADE_POL["📉 Degradation Policy\nTier 1: 2FA — never shed\nTier 2: Campaigns — shed under load\nTier 3: Analytics — shed first\nTier 4: ML — shed freely\nEnforced via DIST_QUOTA\n[SRE-Team]"]
+      SLO_DEF["📐 System SLOs\n2FA: p99 delivered < 10s end-to-end\nCampaign: first batch p99 < 2min\nDLQ resolution SLA: < 4h\nErasure: 30d hot/warm · 90d cold\nReceipt reconcile: < 5min\n[SRE Contract]"]
+      MESH["🕸️ Istio / Linkerd — East-West Only\nmTLS east-west (NOT at edge — CF owns edge TLS)\nSession-level mutual auth · ~0.5ms/hop steady-state\nRe-handshake only on pod restart\nCross-cluster: EKS↔GKE via AWS↔GCP VPC peering\nPer-service traffic policy · Circuit breaking\n[Infra-Svc]"]
+    end
+
+    CDN --> WAF --> ACM --> APIGW
+    APIGW --- API_LIFECYCLE
+    OPTOUT_WH --> COMPLIANCE
+  end
+
+  %% ==========================================================
+  %% LAYER 1 — INGRESS & IDENTITY (AWS dual-region)
+  %% ==========================================================
+  subgraph L1_AWS["🛡️  INGRESS & IDENTITY — AWS us-east-1 (Primary) · us-west-2 (Standby)"]
+    direction TB
+
+    subgraph L1_PRIMARY["  Primary — us-east-1 · EKS Cluster A  "]
+      direction LR
+      UI["🖥️ UI / Authoring\nDrag-and-drop builder\nTemplate versioning\nLive dashboard\n[EKS]"]
+      API_ENTRY["⚡ Developer API\nExternal integrations\nWebhook ingress\n[EKS]"]
+      AUTH["🔐 Keycloak / Auth0\nOIDC · RBAC · JWT · MFA\n[EKS On-Demand]"]
+      REVOKE[("🚫 JWT Revocation\nElastiCache Redis\nImmediate revoke\nAdmin offboard enforcement\n[ElastiCache]")]
+      CTX["🏷️ Tenant Context Injector\nStamps tenant_id on every req\nData isolation enforcement\n[EKS]"]
+      CELL["🔀 Cell Router\nEnvoy Proxy\nTenant-cell routing\nPriority vs standard split\n[EKS]"]
+      DIST_QUOTA["🚦 Rate Limiter\nEnvoy + Redis token bucket\nPer-tenant quota\nAuto backpressure\nThreshold: Kafka lag over 5M\nShed Tier 3+4 first\n[EKS]"]
+      FAST_INGEST["🏎️ Priority Ingestor\nDedicated EKS node pool\n2FA / Transactional only\nBypasses rate limiter\ntenant_id envelope validated at Gold consumer\n[EKS Gold-Pool]"]
+      SUPPRESSION["🚫 Suppression Check\nUnsubscribe · Blocklist\nHard bounce registry\nFail-open with audit log\n[GKE — co-located with CRM]"]
+      FAST_SUPPRESS["🚫 Fast-Path Suppression\nPerformance hint ONLY — not compliance gate\nBloom filter: ~1.2GB for 1B entries at 1% FPR\nAppend-only: cannot delete entries\nUnsubscribe → ALWAYS forces Postgres lookup\nBloom says 'definitely not suppressed' → skip Redis\nBloom says 'maybe suppressed' → Postgres lookup\nFail-open: Redis miss → Postgres source-of-truth\nGDPR: compliance guarantee lives in Postgres only\n[EKS]"]
+      SUPPDB[("📋 Suppression DB\nPostgres: source of truth · GDPR compliance gate\nRedis: read-through cache · max stale 30s\nBloom filter: performance hint in FAST_SUPPRESS\nUnsubscribe invalidates Redis + updates Postgres\nBloom NOT updated on unsub (append-only) — Postgres always wins\nSync: Postgres → Redis on write · not reverse\n[ElastiCache + RDS]")]
+      CAMP_API["🗂️ Campaign API\nAudience · Segmentation\nTemplate CRUD · Campaign CRUD\n⚠️ Runs on GKE (co-located with CRM/AlloyDB)\nDecision: moved from EKS to GKE to eliminate\ncross-cloud synchronous write hot path.\nCampaign writes: p99 < 20ms (same-cloud)\n2FA path unaffected — uses Confluent Gold lane\n[GKE]"]
+    end
+
+    subgraph L1_STANDBY["  Standby — us-west-2 (warm, Route53 activated)  "]
+      direction LR
+      AUTH2["🔐 Auth Service Standby\nRead replica · Promoted on failover\n[EKS Standby]"]
+      DIST_QUOTA2["🚦 Rate Limiter Standby\nConservative defaults on failover\n[EKS Standby]"]
+      SUPPDB2[("📋 Suppression DB Standby\nPostgres streaming replica\nRedis rebuilt on failover\n[RDS Standby]")]
+    end
+
+    AUTH --> REVOKE --> CTX --> CELL
+    CELL -->|"Standard traffic"| DIST_QUOTA
+    CELL -->|"Priority: 2FA/Alerts"| FAST_INGEST
+    DIST_QUOTA --> SUPPRESSION
+    SUPPRESSION <-->|"Lookup"| SUPPDB
+    SUPPRESSION --> CAMP_API
+    FAST_INGEST --> FAST_SUPPRESS
+    FAST_SUPPRESS <-->|"Bloom filter lookup"| SUPPDB
+  end
+
+  %% ==========================================================
+  %% LAYER 2 — DATA LAYER (GCP)
+  %% ==========================================================
+  subgraph L2_GCP["🧠  DATA LAYER — GCP us-central1 (Primary) · europe-west4 (Replica)"]
+    direction TB
+
+    subgraph L2_WRITE["  Write Path — System of Record  "]
+      direction LR
+      WADMIT["🚧 Write Admission Ctrl\nQueue over 80% → 503\nRetry-After header\nIdempotent client retry\n[GKE Sidecar]"]
+      PGBOUNCER["🔗 PgBouncer HA\nConnection pooler · HA pair\nNLB fronted — no SPOF\nMax 10k conns · Tx mode\n[Self-Hosted]"]
+      CRM[("🗄️ Citus / AlloyDB\n32 shards · tenant_id key\nAlloyDB read replicas/region\nPITR every 1h · 200k TPS\n[GCP AlloyDB]")]
+      BIGTABLE[("⚡ Google Bigtable\nHigh-freq contact events\n500k+ TPS · Change stream\n[GCP Bigtable]")]
+      SCHEMA_MIG["🔧 Online Schema Mig\npgroll / pt-osc\nZero-downtime migrations\nRollback plan per migration\n[GKE Job]"]
+    end
+
+    subgraph L2_CDC["  CDC & Schema Enforcement  "]
+      direction LR
+      OUTBOX["📤 Debezium CDC\nTx-bound outbox\nAt-least-once → Silver\n[GKE]"]
+      BT_CDC["📤 Bigtable CDC\nChange stream connector\nSchema-validated → Silver\n[GKE]"]
+      SCHEMA_REG[("📋 Confluent Schema Registry\nRF=3 · Clustered\nAvro / Protobuf\nProducers cache schemas locally · TTL 1h\nFail-open on cache hit · outage grace: 1h\n[Confluent Cloud]")]
+    end
+
+    subgraph L2_LOOKUP["  Identity & Campaign State  "]
+      direction LR
+      SLA_V{"⏱️ Identity SLA Validator\nRejects if over 50ms\nCompliance: hard reject stale\nOffboarded: hard reject stale\nNon-critical: stale circuit-break\nMax stale: 5 min\n[GKE]"}
+      IDMAP[("🗺️ Memorystore Redis\nGlobal ID Map · 3-replica\nTTL 5min · LRU eviction\nSLA under 50ms\n[GCP Memorystore]")]
+      STATUS[("📊 Cloud Spanner\nCampaign Status DB\nTenant-partitioned\nGlobal consistency\ndraft/running/done/failed\n[GCP Spanner]")]
+    end
+
+    subgraph L2_PII["  Privacy & Compliance  "]
+      direction LR
+      PII_MASK["🔏 PII Masking\nAt-write tokenizer\nField-level AES-256\nAudit log on access\n[GKE Sidecar]"]
+      ERASURE["🗑️ GDPR Erasure Controller\nMechanism per tier — NOT generic DELETE:\n· CRM/AlloyDB: soft-delete + async partition drop\n· Bigtable: DeleteFromRow API · row-key scoped\n· ClickHouse: ALTER TABLE DROP PARTITION by token\n  (MergeTree TTL expression — no metadata lock)\n· WARM/Iceberg: GDPR manifest + Iceberg row-delete\n· COLD: revoke token in TOKEN_REG only\n  Glacier objects never touched — unreadable without token\n10k ops/min global · per-tenant queue\nCompliance tier prioritised · 1 pod per active request\nSLA: 30d hot/warm · 90d cold (token revoke SLA: 24h)\n[GKE Controller]"]
+      TOKEN_REG[("🔑 PII Token Registry\nMaps PII token → AES-256 key\nRevocation: delete key → all tokenized data unreadable\nCovers COLD/Glacier without Glacier retrieval\nReplicated: 3-region · RPO zero\nArt.17(3)(b): aggregate data retained · PII unreadable\n[GCP Secret Manager]")]
+      DLP["🔍 Cloud DLP\nAuto PII detection\nTokenization pipelines\nCCPA/GDPR scans\n[GCP DLP]"]
+      ML_IN["🔁 ML Audience Feedback\nAsync fire-and-forget\nUpdates segment scores\n[GKE Async]"]
+    end
+
+    WADMIT --> PGBOUNCER --> CRM
+    CRM --> OUTBOX
+    BIGTABLE --> BT_CDC
+    CRM -->|"Stream updates"| SLA_V --> IDMAP
+    CRM <-->|"Schema-on-write"| SCHEMA_REG
+    CRM <--> PII_MASK
+    OUTBOX <-->|"Schema validation"| SCHEMA_REG
+    BT_CDC <-->|"Schema validation"| SCHEMA_REG
+    SCHEMA_MIG -.->|"Online migration"| CRM
+    DLP -.->|"Daily scheduled PII scan"| CRM
+    DLP -.->|"Daily scheduled PII scan"| BIGTABLE
+    ML_IN -.->|"Async segment tuning"| CRM
+    PII_MASK -.->|"Issues PII token"| TOKEN_REG
+  end
+
+  %% ==========================================================
+  %% LAYER 3 — EVENT BUS (Confluent Cloud + MSK Fallback)
+  %% ==========================================================
+  subgraph L3_BUS["📡  EVENT BUS — Confluent Cloud Multi-Cloud · AWS MSK Cold Standby"]
+    direction TB
+
+    subgraph L3_AUTH_ZONE["  Topic Authorization  "]
+      direction LR
+      KAFKA_ACL["🔐 Confluent RBAC\nPer-topic per-service-acct\nProducer: write-only\nConsumer: read-only\nTenant-ID header enforced\n[Confluent Cloud]"]
+    end
+
+    subgraph L3_LANES["  Traffic Lanes  "]
+      direction LR
+      GOLD[("🥇 Gold Lane\nConfluent Dedicated · RF=3\n120 partitions · ISR=2\nRetention: 72h\n2FA/transactional only — low absolute volume\nNo S3 overflow: Gold spill = capacity incident, not normal ops\nGold disk >70% → P0 alert + immediate partition scale\nLag alert: over 50k → SRE\n[Confluent Cluster-A]")]
+      SILVER[("🥈 Silver Lane\nConfluent Dedicated · RF=3\n600 partitions · ISR=2\nRetention: 7d\nAuto-scaling: min 60 partitions at low load\nPrivate Link to EKS VPC\nLag alert: over 5M → SRE\n[Confluent Cluster-B]")]
+    end
+
+    subgraph L3_RESILIENCE["  Overflow · DLQ · Recovery · Fallback  "]
+      direction LR
+      SILVER_S3[("☁️ Silver S3 Iceberg\nAWS S3 + Iceberg\nSpill: lag over 1M\nRe-entry under 15min\n[AWS S3]")]
+      REHYDRATE["💧 Hydration Worker\n500 msg/s per tenant cap\nThrottled S3 re-entry\n[EKS Worker]"]
+      DLQ[("🏥 Dead Letter Queue\nConfluent DLQ topic\nTTL 7d · Max 3 retries\nDepth alert over 1000\n[Confluent]")]
+      REPLAY["▶️ DLQ Replay\nGlobal cap: 5k msg/s\nPer-tenant: 200 msg/s\nRoot-cause gate: SRE clears\nAudit trail per replay\nGold failures → Gold\nSilver failures → Silver\n[EKS Controller]"]
+      MSK["☁️ AWS MSK Fallback\nMSK Serverless\nMirrorMaker 2 sync\nCold standby\n[AWS MSK]"]
+    end
+
+    SILVER -->|"Congestion spill"| SILVER_S3
+    SILVER_S3 -->|"Throttled re-entry"| REHYDRATE --> SILVER
+    DLQ --> REPLAY
+    REPLAY -->|"Gold re-inject"| GOLD
+    REPLAY -->|"Silver re-inject"| SILVER
+    KAFKA_ACL -.->|"Enforces on"| GOLD
+    KAFKA_ACL -.->|"Enforces on"| SILVER
+    %% Policy enforcement only — not a data flow; ML_BUFFER is a Confluent topic governed by same ACL plane
+    KAFKA_ACL -.->|"Enforces on"| ML_BUFFER
+  end
+
+  %% ==========================================================
+  %% LAYER 4 — EXECUTION ENGINE (EKS + GKE)
+  %% ==========================================================
+  subgraph L4_EXEC["🚀  EXECUTION ENGINE — EKS + GKE · Karpenter · Spot + On-Demand"]
+    direction TB
+
+    subgraph L4_ORCH["  Orchestration  "]
+      direction LR
+      SAGA["🎼 Temporal.io\nSaga Orchestrator\nCompensating txns\nSaga TTL: 24h max\nIdempotent steps\nBypasses SEND_SCHED: 2FA/hard-transactional only\nTemporal Server: 3-node · Postgres backend\n[EKS On-Demand]"]
+      CHOREO["📨 Kafka Consumers\nBulk stateless workers\nHPA: 10–500 pods\nPartition:pod ratio 1.2x\n[EKS Spot]"]
+      SEND_SCHED["⏰ Send-Time Optimizer\nTimezone-aware\nStaggered burst per tenant\nTenant-aware canary routing\nRoutes through CB + TB\n[EKS]"]
+      PROV_BUDGET["📊 Provider Budget Mgr\nPer-tenant fallback quota\nFallback: 60% primary limit\nCost alert: over 2x spend\nPrevents single-tenant monopoly\n[EKS]"]
+    end
+
+    subgraph L4_STATE["  State Tier — 3 Isolated Clusters (Cross-AZ)  "]
+      direction LR
+      LCACHE["⚡ Local LRU Cache\nIn-process · sub-ms\nMax 10k entries/worker\nReduces Redis pressure\n[Worker-Node]"]
+      DEDUP_L1["🧠 L1 Dedup — In-Process LRU\nPer-worker · ~512MB cap\nLast 100k message IDs\nSub-ms · zero network\nEviction: LRU on cap breach\n[Worker-Node]"]
+      DEDUP_L2[("🔵 L2 Dedup — Counting Bloom Filter\n~72GB total · 10B keys @ 0.1% FPR\nCounting (4-bit): supports TTL expiry via counter decrement\nShared across all workers · Redis-backed bit array\nDR: shadow copy in us-west-2 kept warm by DEDUP_SHADOW\nFPR miss = rare duplicate → audit log\n[ElastiCache — Bloom]")]
+      DEDUP_L3[("🔴 L3 Dedup — Redis Confirmed Dupes\nStores ONLY confirmed duplicate hits\n~14GB vs 1.4TB for full keyspace — 99% smaller\nTTL 24h · Cross-AZ · 3-shard · Fail-open\nDR: cold on failover — pre-warms in <1s (14GB replay trivial)\nL2 Bloom absorbs duplicate storm before L3 is needed\n[ElastiCache — Dedup]")]
+      R_STATE[("🟠 ElastiCache — Saga State\n3-shard · 3-replica · Cross-AZ\nSaga step tracking\nRebuild from Spanner on DR\nIsolated failure domain\n[ElastiCache]")]
+      R_RATE[("🟡 ElastiCache — Rate Buckets\n3-shard · 3-replica · Cross-AZ\nKey: {tenant_id}:{provider} prefix\nLogical per-tenant isolation · no extra nodes\n5k tenants × providers = ~15k logical buckets\nConservative defaults on DR\nIsolated failure domain\n[ElastiCache]")]
+    end
+
+    subgraph L4_WORKERS["  Channel Workers — HPA Autoscaled (EKS Spot)  "]
+      direction LR
+      WEMAIL["📧 Email Pool\nPodDisruptionBudget: maxUnavailable=1\nGraceful drain: 90s on Spot interrupt\n[EKS Spot]"]
+      WSMS["💬 SMS / WhatsApp\nPodDisruptionBudget: maxUnavailable=1\nGraceful drain: 90s on Spot interrupt\n[EKS Spot]"]
+      WPUSH["🔔 Push — FCM / APNs\nPodDisruptionBudget: maxUnavailable=1\nGraceful drain: 90s on Spot interrupt\nCB: per-tenant · bad batch isolates to that tenant only\nNo alternate provider: that tenant's CB open → their msgs → DLQ\nOther tenants: unaffected · no cell-wide blackout\n[EKS Spot]"]
+      WSOCIAL["📱 Social — Meta / LinkedIn\nPodDisruptionBudget: maxUnavailable=1\nGraceful drain: 90s on Spot interrupt\nCB: per-tenant · bad batch isolates to that tenant only\nNo alternate provider · CB open → that tenant's msgs → DLQ\n[EKS Spot]"]
+    end
+
+    subgraph L4_FAULT["  Provider Protection & Delivery Assurance  "]
+      direction LR
+      CB["⚙️ Circuit Breaker — Per-Tenant · Per-Provider\nResilience4j · 5k tenants × 2 push providers = 10k CB instances\nMemory: ~20MB total — negligible vs blast radius of shared CB\nIsolation: 1 bad tenant cannot trip CB for other tenants\nPer-provider: APNs 429 burst ≠ FCM down — separate error counters\nPush-specific: wider error window (30s vs 10s) — push providers are bursty\nPush threshold: open at 80% errors (not 50%) — APNs/FCM false-positive rate\nEmail/SMS: standard 10s window · 50% threshold\nHalf-open probe: 30s · single probe request before re-close\nFallback via PROV_BUDGET · Priority bulkhead: SAGA 2FA isolated\n[EKS Sidecar]"]
+      TB["🪙 Token Bucket — Per-Tenant · Per-Provider\nKey: {tenant_id}:{provider} — logical isolation in shared Redis\nNo extra nodes: key-space partitioning in R_RATE\n1 tenant burst cannot exhaust another tenant's quota\nRate-controlled dispatch only · Retry logic lives in CB\nPerm-fail → DLQ\n[EKS Sidecar]"]
+      RECEIPT["📬 Receipt Reconciler\nWebhook ingestor\nsent/delivered/bounced\nHard bounce → Suppression\nUpdates STATUS_DB\nAWS creds: Vault sidecar · GCP creds: WIF short-lived SA token\nSLA: reconcile under 5min\n[EKS]"]
+      RECEIPT_SWEEP["🔍 Receipt Sweep\nEvery 10min\nMissing over 15min\nProvider API query\nUnresolvable → DLQ\n[EKS CronJob]"]
+    end
+
+    subgraph L4_DEPLOY["  Deployment Safety  "]
+      direction LR
+      CANARY["🐦 Argo Rollouts\nTenant-aware · Small tenants first\n5% → 25% → 100%\nAuto-rollback on error spike\n[Argo CD]"]
+      LOADTEST["🔬 k6 / Gatling\nMust pass 2x target TPS\nBlocks promotion\nPer scale milestone\n[QE Gate]"]
+    end
+
+    %% Orchestration → State
+    SAGA --> LCACHE
+    CHOREO --> LCACHE
+    LCACHE --> DEDUP_L1
+    LCACHE --> R_STATE
+    LCACHE --> R_RATE
+    %% Tiered dedup: L1 in-process → L2 Counting Bloom → L3 Redis confirmed dupes
+    %% Each layer is a gate: hit at L1 = free, hit at L2 = <1ms, hit at L3 = ~1ms
+    DEDUP_L1 -.->|"Miss: check L2"| DEDUP_L2
+    DEDUP_L2 -.->|"Confirmed dupe: record in L3"| DEDUP_L3
+    DEDUP_L1 -.->|"Dedup gate · fail-open"| WEMAIL
+    DEDUP_L1 -.->|"Dedup gate · fail-open"| WSMS
+    DEDUP_L1 -.->|"Dedup gate · fail-open"| WPUSH
+    DEDUP_L1 -.->|"Dedup gate · fail-open"| WSOCIAL
+    %% Workers READ saga state from R_STATE (pull model — separate from dedup)
+    WEMAIL -.->|"Reads saga state"| R_STATE
+    WSMS -.->|"Reads saga state"| R_STATE
+    WPUSH -.->|"Reads saga state"| R_STATE
+    WSOCIAL -.->|"Reads saga state"| R_STATE
+    R_RATE --> TB
+    %% Send path (bulk via CHOREO→SEND_SCHED; priority via SAGA direct to CB)
+    %% SAGA skips SEND_SCHED (no timezone delay on 2FA) but MUST go through CB+TB for provider protection
+    SAGA -.->|"Priority send · bypasses scheduler"| CB
+    CHOREO --> SEND_SCHED
+    SEND_SCHED --> CB
+    PROV_BUDGET --> CB
+    CB --> TB
+    TB -.->|"Rate-controlled dispatch"| WEMAIL
+    TB -.->|"Rate-controlled dispatch"| WSMS
+    TB -.->|"Rate-controlled dispatch"| WPUSH
+    TB -.->|"Rate-controlled dispatch"| WSOCIAL
+    TB -->|"Perm-fail"| DLQ
+    %% Receipts — all 4 channels must feed RECEIPT for delivery status + hard bounce tracking
+    WEMAIL -->|"Provider webhooks"| RECEIPT
+    WSMS -->|"Provider webhooks"| RECEIPT
+    WPUSH -->|"APNs/FCM delivery callbacks"| RECEIPT
+    WSOCIAL -->|"Platform delivery callbacks"| RECEIPT
+    RECEIPT_SWEEP -->|"Force-reconcile"| RECEIPT
+    RECEIPT_SWEEP -.->|"Unresolvable"| DLQ
+    %% Deploy gates
+    LOADTEST -.->|"Must pass 2x TPS"| CANARY
+  end
+
+  %% ==========================================================
+  %% EXTERNAL PROVIDERS — Governed by PROV_BUDGET + CB
+  %% ==========================================================
+  subgraph PROVIDERS["📨  EXTERNAL PROVIDERS — Ordered Fallback Chain · PROV_BUDGET Gated"]
+    direction LR
+
+    subgraph EMAIL_CHAIN["  Email Fallback Chain  "]
+      SES["AWS SES\nPrimary\nDKIM · Dedicated IPs\n[AWS]"]
+      SG["SendGrid\nSecondary fallback\n60% of SES quota\n[3rd-Party]"]
+      MG["Mailgun\nTertiary fallback\n40% of SES quota\n[3rd-Party]"]
+    end
+
+    subgraph SMS_CHAIN["  SMS/WhatsApp Fallback Chain  "]
+      TW["Twilio\nPrimary SMS+WA\nReceipt loop\n[3rd-Party]"]
+      VN["Vonage\nSecondary\n60% Twilio cap\n[3rd-Party]"]
+      MB["MessageBird\nTertiary\nPer-country routing\n[3rd-Party]"]
+    end
+
+    subgraph PUSH_CHAIN["  Push  "]
+      FCM["FCM\nAndroid\nBatch API v1\n[Google]"]
+      APNS["APNs\niOS · HTTP/2\nCert rotation\n[Apple]"]
+    end
+
+    subgraph SOCIAL_CHAIN["  Social  "]
+      META_API["Meta Graph API\nFB · Instagram\nOAuth rotation\n[Meta]"]
+      LI_API["LinkedIn\nMarketing API\nOAuth rotation\n[LinkedIn]"]
+    end
+  end
+
+  %% ==========================================================
+  %% LAYER 5 — ANALYTICS & INTELLIGENCE (GCP + AWS)
+  %% ==========================================================
+  subgraph L5_ANALYTICS["📊  ANALYTICS & INTELLIGENCE — GCP Dataflow · ClickHouse · AWS S3/Glacier"]
+    direction TB
+
+    subgraph L5_STREAM["  Stream Processing  "]
+      direction LR
+      FLINK["⚡ Apache Flink on Dataflow\nExactly-once semantics\nRocksDB incremental\nCheckpoint 60s → GCS\nMax state 500GB/job\nAlert: checkpoint over 120s\nWatermark: 30s late arrival\n[GCP Dataflow]"]
+      PII_STRIP["🔏 Pre-Analytics Anonymizer\nStrips PII before analytics write\nTokenized IDs only · zero PII guarantee\nGDPR: no personal data reaches HOT/WARM/COLD\n[GKE Sidecar]"]
+      MLGW["🤖 Vertex AI Pipelines\nML Feedback Gateway\nEngagement scoring model\nAsync → segment tuning\n[GCP Vertex AI]"]
+      ML_BUFFER[("🗄️ ML Signal Buffer\nConfluent Kafka topic\nTTL 1h · Absorbs ML outages\nAlert: drop over 5% in 10min\nAuto-drain on recovery\n[Confluent]")]
+    end
+
+    subgraph L5_STORE["  Storage Tiers  "]
+      direction LR
+      HOT[("🔥 ClickHouse Cloud — Hot\n8-shard · RF=3 · MergeTree\nTTL 30d · 2M rows/s\nRF=3: node failure → no data loss\n6h ETL gap only on full cluster loss\nRebuild from WARM on total DR\n[GCP / ClickHouse Cloud]")]
+      WARM[("❄️ AWS S3 + Iceberg — Warm\nBatch ETL every 6h · Parquet\nZ-order by tenant · Retention 2yr\nPII-free: PII_STRIP guarantees tokenized-only\nEU data: S3 eu-west-1 · AWS DPA/SCCs in place\nMulti-region inherently\n[AWS S3]")]
+      COLD[("🧊 AWS S3 Glacier — Cold\nDeep Archive · Annual archival\n7yr compliance retention · aggregate data only\nAll data tokenized via TOKEN_REG\nGDPR erasure: revoke token in TOKEN_REG\nGlacier objects never retrieved for erasure\nAggregate retained unmodified · Art.17(3)(b)\nCost: no retrieval fee for erasure path\n[AWS Glacier]")]
+    end
+
+    FLINK --> PII_STRIP --> HOT
+    FLINK --> MLGW
+    MLGW --> ML_BUFFER
+    ML_BUFFER -.->|"Drain on recovery"| MLGW
+    HOT -.->|"Batch ETL every 6h"| WARM
+    WARM -.->|"Annual archival"| COLD
+  end
+
+  %% ==========================================================
+  %% OBSERVABILITY & DR — Datadog · Grafana · Elastic · PagerDuty
+  %% ==========================================================
+  subgraph L6_OBS["📡  OBSERVABILITY & DR — Datadog · Grafana Cloud · PagerDuty · Gremlin · Argo"]
+    direction TB
+
+    subgraph OBS_TELEMETRY["  Telemetry  "]
+      direction LR
+      DD["📈 Datadog APM\nMetrics · Traces · APM\nKafka lag · DLQ depth\nProvider fallback cost\np99 latency · error rates\n[Datadog]"]
+      GRAFANA["📊 Grafana Cloud + Tempo\nDashboards · Tail-based tracing\n100% errors · 1% healthy paths\nTrace-ID on every event\n[Grafana Cloud]"]
+      ELASTIC["📋 Elastic Cloud\nStructured JSON logs\nCorrelated by trace-ID\n30d hot retention\n[Elastic Cloud]"]
+    end
+
+    subgraph OBS_SLA["  SLA Monitoring & Alerting  "]
+      direction LR
+      MON{{"🟢 SLA Monitor\nKafka lag thresholds\nCircuit states · DLQ depth\nWorker errors · p99 latency\nProvider fallback rate+cost\nML drop rate · Checkpoint lag\nReceipt sweep misses\nErasure SLA: 30d hot/warm · 90d cold\nDEDUP_SHADOW lag: alert if > 30s · P1 (affects RTO)\n[SRE-Team]"}}
+      ALERT["🔔 PagerDuty\nEscalation routing\nRunbook link per alert\nAuto backpressure signal\nThreshold-based\n[PagerDuty]"]
+      RUNBOOK["📖 Runbooks\nDLQ overflow · CB reset\nKafka rebalance · Redis DR\nFlink offset recovery\nCRM migration rollback\nRedis cold-start rebuild\nClickHouse rebuild from WARM\n[Confluence]"]
+    end
+
+    subgraph OBS_DR["  Disaster Recovery  "]
+      direction LR
+      R53["🔄 Route53 Failover\nHealth-check based · Auto-failover under 60s\nRPO 1h\nRTO 15min: if DEDUP_SHADOW lag < 30s at time of failover\nRTO 30min: if DEDUP_SHADOW lagged — pre-warm required first\nActive-passive · 2 regions\n[AWS Route53]"]
+      MM2["🔁 MirrorMaker 2\nCross-region Kafka replication · Silver lane only\nGold NOT replicated: 2FA volume small · Confluent RF=3 sufficient\nOffset translation: MM2 maps Confluent→MSK offsets\nOn failover: up to 15min offset overlap → duplicate storm if DEDUP cold\nDEDUP_SHADOW continuously consumes MSK → keeps DR DEDUP_L2 warm\nL3 Redis (14GB): pre-warms in <1s on failover — negligible\nRTO honest: 15min (shadow-warm eliminates 12min pre-warm wait)\nDR runbook: 1) verify DEDUP_SHADOW lag < 30s 2) start MSK workers 3) verify\n[Confluent MM2]"]
+      DEDUP_SHADOW["👻 DR Dedup Shadow-Warm\nRuns CONTINUOUSLY in us-west-2 DR region\nConsumes from MSK Silver (MM2 feed)\nWrites to DR DEDUP_L2 Bloom only — no sends triggered\nKeeps DR Bloom current: lag target < 30s\nGate: Channel Workers in DR blocked until DEDUP_SHADOW lag < 30s\nCost: ~$400/month · ElastiCache r7g.2xlarge × 2 AZ\nvs 104M duplicate sends per failover event\n[EKS DR — Standby]"]
+      DR_DRILL["🧪 DR Drill Program\nGremlin chaos monthly\nFull failover quarterly\nGame day bi-annually\nResults → Runbook\n[Gremlin + SRE]"]
+    end
+
+    subgraph OBS_DEPLOY["  GitOps & Deployment  "]
+      direction LR
+      ARGOCD["🚀 Argo CD\nGitOps · All infra as code\nDrift detection · Audit trail\n[Argo CD]"]
+    end
+
+    DD & GRAFANA & ELASTIC --> MON
+    MON --> ALERT
+    ALERT --> RUNBOOK
+    DR_DRILL -.->|"Validates"| R53
+    DR_DRILL -.->|"Validates"| MM2
+    DR_DRILL -.->|"Results update"| RUNBOOK
+  end
+
+  %% ==========================================================
+  %% GOVERNANCE — Azure Purview · CloudTrail · Terraform
+  %% ==========================================================
+  subgraph GOV["⚖️  GOVERNANCE — Azure Purview · AWS CloudTrail · GCP Audit Logs · Terraform Cloud"]
+    direction LR
+    PURVIEW["📚 Azure Purview\nData lineage tracking\nGCP + AWS connectors registered\nPII catalog · Compliance reports\n[Azure]"]
+    ENTRA["🔐 Azure Entra ID\nEmployee SSO · OIDC (no SAML)\nPrivileged Identity Mgmt\n[Azure]"]
+    COST["💰 AWS Cost Explorer\nPer-tenant cost tracking\nFallback spend alert 2x\nChargeback per tenant\n[AWS]"]
+    TRAIL["📋 AWS CloudTrail\nAll API calls logged\nSOC2/ISO27001 evidence\n7yr archive\n[AWS]"]
+    GCP_AUDIT["📋 GCP Cloud Audit Logs\nData access logs: CRM · Bigtable · Spanner\n400-day retention\nForwarded to Elastic for correlation\n[GCP]"]
+    TF["🏗️ Terraform Cloud\nAll infra as code\nMulti-cloud state mgmt\nSentinel policy-as-code\n[HashiCorp]"]
+  end
+
+  %% ==========================================================
+  %% INTER-LAYER CONNECTIONS — ALL VERIFIED
+  %% ==========================================================
+
+  %% Edge → Ingress
+  APIGW -->|"Clean traffic"| UI
+  APIGW -->|"Clean traffic"| API_ENTRY
+  SECRETS -.->|"Sidecar injection"| AUTH
+  SECRETS -.->|"Sidecar injection"| CRM
+  SECRETS -.->|"Sidecar injection"| SAGA
+  SECRETS -.->|"Sidecar injection"| FLINK
+  SECRETS -.->|"Sidecar injection"| RECEIPT
+  SECRETS -.->|"Sidecar injection"| CAMP_API
+  SECRETS -.->|"Sidecar injection"| SUPPRESSION
+  MESH -.->|"mTLS east-west"| L1_AWS
+  MESH -.->|"mTLS east-west"| L4_EXEC
+  COMPLIANCE -.->|"Opt-out signals"| SUPPDB
+  COMPLIANCE -.->|"Opt-out event"| STATUS
+  DEGRADE_POL -.->|"Priority tiers enforced by"| DIST_QUOTA
+
+  %% L1 entry → auth chain
+  UI --> AUTH
+  API_ENTRY --> AUTH
+
+  %% L1 → L2 (campaign write path — CAMP_API now co-located on GKE, same-cloud write)
+  CAMP_API <-->|"Read/Write campaign + contact data · same-cloud"| WADMIT
+  CAMP_API -->|"High-freq contact events · same-cloud GKE→Bigtable"| BIGTABLE
+
+  %% L1 hot path → L3 (2FA bypass, suppression checked)
+  FAST_SUPPRESS -->|"Passed bloom check"| GOLD
+
+  %% L1 standard path → L3 (via L2 write)
+  %% Campaign sends go: CAMP_API → WADMIT → CRM → OUTBOX → SILVER
+
+  %% L2 → L3 CDC streams
+  OUTBOX -.->|"Async CRM CDC"| SILVER
+  BT_CDC -.->|"Async append-store CDC"| SILVER
+  SCHEMA_REG -.->|"Schema enforcement"| GOLD
+  SCHEMA_REG -.->|"Schema enforcement"| SILVER
+
+  %% L3 → L4 execution
+  GOLD -->|"High-priority events"| SAGA
+  SILVER -->|"Bulk campaign events"| CHOREO
+
+  %% L4 workers → external providers (ordered fallback chain)
+  WEMAIL -->|"Primary"| SES
+  CB -.->|"Email fallback"| SG
+  CB -.->|"Email tertiary"| MG
+  WSMS -->|"Primary"| TW
+  CB -.->|"SMS fallback"| VN
+  CB -.->|"SMS tertiary"| MB
+  WPUSH -->|"Android"| FCM
+  WPUSH -->|"iOS"| APNS
+  WSOCIAL -->|"Social"| META_API
+  WSOCIAL -->|"Social"| LI_API
+
+  %% L4 write-backs → L2
+  RECEIPT -->|"Delivery status"| STATUS
+  RECEIPT -->|"Hard bounce"| SUPPDB
+  R_STATE -.->|"Saga state rebuild source"| STATUS
+  STATUS -.->|"Campaign status API · same-cloud GCP read"| CAMP_API
+
+  %% L4 → L5 analytics events
+  WEMAIL -.->|"Engagement events"| FLINK
+  WSMS -.->|"Engagement events"| FLINK
+  RECEIPT -.->|"Delivery status events"| FLINK
+  WPUSH -.->|"Engagement events"| FLINK
+  WSOCIAL -.->|"Engagement events"| FLINK
+
+  %% L5 → L1 live dashboard
+  FLINK -.->|"Live stats feed"| UI
+
+  %% L5 → L2 ML feedback loop
+  ML_BUFFER -.->|"Async audience tuning"| ML_IN
+
+  %% GDPR erasure cascade — mechanism-specific per tier
+  ERASURE -.->|"Soft-delete + async partition drop"| CRM
+  ERASURE -.->|"Completion audit · Art.17"| TRAIL
+  ERASURE -.->|"DeleteFromRow API"| BIGTABLE
+  ERASURE -.->|"Rate-limited"| STATUS
+  ERASURE -.->|"ALTER TABLE DROP PARTITION · MergeTree TTL"| HOT
+  ERASURE -.->|"Iceberg row-delete manifest"| WARM
+  ERASURE -.->|"Revoke token · Glacier untouched"| TOKEN_REG
+  ERASURE -.->|"Rate-limited"| SUPPDB
+  ERASURE -.->|"SLA progress events"| MON
+
+  %% Observability telemetry wires
+  L1_AWS -.->|"Traces + Metrics + Logs"| DD
+  L2_GCP -.->|"Traces + Metrics + Logs"| DD
+  L3_BUS -.->|"Kafka lag · throughput"| DD
+  L4_EXEC -.->|"Worker errors · circuit state · cost"| DD
+  L5_ANALYTICS -.->|"Query latency · ETL lag · checkpoint"| DD
+  ALERT -.->|"Auto backpressure threshold-triggered"| DIST_QUOTA
+
+  %% DR activation paths
+  R53 -.->|"Failover activates"| AUTH2
+  R53 -.->|"Failover activates"| DIST_QUOTA2
+  R53 -.->|"Failover activates"| SUPPDB2
+  MM2 -.->|"Replicates to MSK standby"| MSK
+  MON -.->|"Confluent health alert"| MSK
+  MSK -.->|"Continuously feeds DR dedup"| DEDUP_SHADOW
+  DEDUP_SHADOW -.->|"Shadow-warms DR Bloom · lag < 30s"| DEDUP_L2
+  DEDUP_SHADOW -.->|"Gate: workers blocked until lag < 30s"| WEMAIL
+  DEDUP_SHADOW -.->|"Gate: workers blocked until lag < 30s"| WSMS
+  DEDUP_SHADOW -.->|"Gate: workers blocked until lag < 30s"| WPUSH
+  DEDUP_SHADOW -.->|"Gate: workers blocked until lag < 30s"| WSOCIAL
+  %% GCP data replication to GCP europe-west4 (separate from AWS Route53 DNS failover)
+  L2_GCP -.->|"AlloyDB streaming replica → europe-west4"| L1_STANDBY
+  %% SLO contract feeds MON thresholds
+  SLO_DEF -.->|"Alert thresholds"| MON
+
+  %% Deployment gates
+  CANARY -.->|"Tenant-aware rollout"| WEMAIL
+  CANARY -.->|"Tenant-aware rollout"| WSMS
+  CANARY -.->|"Tenant-aware rollout"| WPUSH
+  CANARY -.->|"Tenant-aware rollout"| WSOCIAL
+  CANARY -.->|"Tenant-aware rollout"| SAGA
+  CANARY -.->|"Tenant-aware rollout"| FLINK
+  ARGOCD -.->|"GitOps manages"| CANARY
+
+  %% Governance audit wires
+  ENTRA -.->|"OIDC federation (PKCE · no SAML)"| AUTH
+  PURVIEW -.->|"Lineage"| CRM
+  PURVIEW -.->|"Lineage"| HOT
+  PURVIEW -.->|"Lineage"| WARM
+  TRAIL -.->|"Audit all API calls"| APIGW
+  %% GCP data layer audit trail (SOC2 CC6.1)
+  CRM -.->|"Data access logs"| GCP_AUDIT
+  BIGTABLE -.->|"Data access logs"| GCP_AUDIT
+  STATUS -.->|"Data access logs"| GCP_AUDIT
+  GCP_AUDIT -.->|"Forwarded for correlation"| ELASTIC
+  %% Cost tracking — all channels + Confluent
+  COST -.->|"Cost tracking"| WEMAIL
+  COST -.->|"Cost tracking"| WSMS
+  COST -.->|"Cost tracking"| WPUSH
+  COST -.->|"Cost tracking"| WSOCIAL
+  COST -.->|"Confluent spend tracking"| L3_BUS
+  COST -.->|"Actual spend data"| PROV_BUDGET
+  TF -.->|"Manages all infra as code"| ARGOCD
+
+  %% ==========================================================
+  %% STYLES — colour by cloud/role
+  %% ==========================================================
+
+  classDef cf      fill:#1a0d00,stroke:#F6821F,stroke-width:1.5px,color:#ffa85c
+  classDef aws     fill:#1a0e00,stroke:#FF9900,stroke-width:1.5px,color:#ffbe5c
+  classDef gcp     fill:#071524,stroke:#4285F4,stroke-width:1.5px,color:#85b4ff
+  classDef azure   fill:#001824,stroke:#008AD7,stroke-width:1.5px,color:#5bc5f5
+  classDef k8s     fill:#071020,stroke:#326CE5,stroke-width:1.5px,color:#7fa8f5
+  classDef ext     fill:#120a1e,stroke:#9B59B6,stroke-width:1.5px,color:#c594e0
+  classDef gold    fill:#1e1600,stroke:#F5C842,stroke-width:2px,color:#F5C842
+  classDef red     fill:#180707,stroke:#FF5757,stroke-width:1.5px,color:#ff9a9a
+  classDef green   fill:#07180e,stroke:#3DDC84,stroke-width:1.5px,color:#7eedb0
+  classDef teal    fill:#071818,stroke:#3DD6D0,stroke-width:1.5px,color:#7eecea
+  classDef pink    fill:#1a0714,stroke:#FF6EB4,stroke-width:1.5px,color:#ffadd6
+  classDef warn    fill:#1a0e00,stroke:#FF9340,stroke-width:2px,color:#ffbe8a
+  classDef decide  fill:#0d0f14,stroke:#F5C842,stroke-width:1.5px,color:#F5C842
+
+  %% Edge layer
+  class CDN,WAF cf
+  class ACM,APIGW,SECRETS,SES,R53,COST,TRAIL,SILVER_S3,WARM,COLD,MSK aws
+  class API_LIFECYCLE,DEGRADE_POL,SLO_DEF warn
+  class OPTOUT_WH,COMPLIANCE pink
+
+  %% L1 Ingress
+  class UI,API_ENTRY,AUTH,CTX,DIST_QUOTA,CAMP_API k8s
+  class REVOKE red
+  class CELL decide
+  class FAST_INGEST gold
+  class SUPPRESSION,FAST_SUPPRESS red
+  class SUPPDB red
+  class AUTH2,DIST_QUOTA2,SUPPDB2 aws
+
+  %% L2 Data
+  class WADMIT warn
+  class PGBOUNCER,CRM,BIGTABLE,OUTBOX,BT_CDC,SCHEMA_REG,IDMAP,TOKEN_REG gcp
+  class STATUS gcp
+  class SCHEMA_MIG teal
+  class SLA_V decide
+  class PII_MASK,ERASURE pink
+  class DLP,ML_IN gcp
+  class MESH teal
+
+  %% L3 Event Bus
+  class GOLD gold
+  class SILVER green
+  class KAFKA_ACL pink
+  class DLQ,REPLAY red
+  class REHYDRATE green
+
+  %% L4 Execution
+  class SAGA,CHOREO,SEND_SCHED,PROV_BUDGET warn
+  class LCACHE,DEDUP_L1 k8s
+  class DEDUP_L2,DEDUP_L3,R_STATE,R_RATE aws
+  class WEMAIL,WSMS,WPUSH,WSOCIAL k8s
+  class CB,TB,RECEIPT,RECEIPT_SWEEP k8s
+  class CANARY,LOADTEST teal
+
+  %% Providers
+  class SES aws
+  class SG,MG,TW,VN,MB,FCM,APNS,META_API,LI_API ext
+
+  %% L5 Analytics
+  class FLINK,PII_STRIP,MLGW,ML_BUFFER,HOT gcp
+
+  %% L6 Observability
+  class DD,GRAFANA,ELASTIC,ALERT,RUNBOOK,ARGOCD ext
+  class MON teal
+  class MM2,DR_DRILL,DEDUP_SHADOW teal
+
+  %% Governance
+  class PURVIEW,ENTRA azure
+  class COST,TRAIL,GCP_AUDIT aws
+  class TF ext
