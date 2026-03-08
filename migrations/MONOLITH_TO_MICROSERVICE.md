@@ -1,5 +1,9 @@
 # Monolith to Microservices — Migration Strategy
 
+> **System Design Playbook** · `migrations/monolith-to-microservices.md` · v7.0 · 2025
+>
+> *A practical field guide — from tangled codebases to independently deployable services.*
+
 ---
 
 ## TL;DR — For Stakeholders and Time-Pressed Engineers
@@ -8,7 +12,7 @@ Migrating from a monolith to microservices is one of the highest-risk architectu
 
 **The risk of migrating prematurely** is high: teams under 8 engineers, products under 12 months old, or organisations without a dedicated platform/DevOps capability routinely end up slower and more fragile after migration than before. **The risk of not migrating when genuinely ready** is also real: deployment bottlenecks, inability to scale individual components, and team coordination overhead compound with every new hire.
 
-The decision must be driven by a named, specific engineering pain — not by industry trend. A successful first service extraction takes **8–14 weeks** end to end. A full platform migration typically spans **12–24 months** depending on monolith complexity and organisational readiness. This document is the complete field guide for doing it right.
+The decision must be driven by a named, specific engineering pain — not by industry trend. A successful first service extraction takes **8–14 weeks** end to end. A full platform migration typically spans **12–24 months** depending on monolith complexity and organisational readiness. **Steady-state operational overhead is real and often underestimated**: a 15-service architecture requires separate CI/CD pipelines, on-call rotation coverage, runbooks, staging environments, and platform tooling (service mesh, OPA, SPIRE, Temporal, data warehouse pipeline) for every service — budget for this infrastructure and staffing cost before committing to the migration. This document is the complete field guide for doing it right.
 
 ---
 
@@ -86,6 +90,11 @@ The biggest mistake teams make is migrating too early. Microservices introduce r
 | Team ownership confusion | More than 2 teams share the same codebase | 3 teams all editing the same auth module |
 | Outage blast radius is huge | A minor bug kills the whole product | A broken report query crashes the entire API |
 | Tech stack lock-in | One legacy stack blocks modern tooling | Need ML inference but entire app is PHP 5 |
+| **Org structure matches proposed service boundaries** | You have named teams ready to own each service | "Payments team owns Payment Service end to end" |
+
+That last signal — **Conway's Law alignment** — is the one most teams skip and most migrations fail because of. Conway's Law states that organisations design systems that mirror their own communication structure. If your org chart does not match your proposed service boundaries, your services will drift back toward coupling over time because the teams communicating most frequently will share the most code.
+
+Before committing to a migration, draw your proposed service map and your org chart side by side. If they do not align, you have two choices: restructure the teams to match the services, or redesign the service boundaries to match the teams. The worst choice — the one most teams make — is to proceed with a mismatch and hope the architecture enforces itself.
 
 ### Weak Signals — Do Not Migrate Yet
 
@@ -177,6 +186,14 @@ This is the most underestimated decision in any migration. Pick the wrong first 
 
 > 💡 **Pro Tip:** Draw a simple dependency diagram. The node with the fewest arrows pointing *into* it is usually your best starting point. Low incoming dependencies = low coupling.
 
+### Finding Boundaries — Domain-Driven Design
+
+The criteria above — low coupling, well-defined boundary, clear owner — are Domain-Driven Design (DDD) concepts, even if you've never called them that. The DDD term for "a service with a well-defined boundary and its own data" is a **Bounded Context**. The data that a Bounded Context fully owns and is responsible for is an **Aggregate**.
+
+Before picking your first service, you need to know where your Bounded Contexts are. The most practical workshop technique for finding them is **Event Storming**: gather engineers and domain experts in a room, map every domain event (OrderPlaced, PaymentCharged, StockReserved) on sticky notes, group them by natural workflow, and identify where team ownership and data ownership cluster together. Those clusters become your Bounded Contexts — and your service candidates.
+
+You do not need to read the full DDD literature before starting. You do need to do the Event Storming session before drawing service boundaries. Teams that skip this step split services by technical layer (controllers, services, repositories) rather than by domain — and produce distributed monoliths within 12 months.
+
 ---
 
 ## 5. Handling the Shared Database Problem
@@ -249,6 +266,30 @@ Works perfectly. And your transactional services are not affected at all.
 - Use a stream processor (Kafka Streams, Flink, or a managed ETL tool like Fivetran) to land data into the warehouse.
 - With a well-tuned pipeline, the warehouse typically reflects source data within **minutes to low tens of minutes** under normal load. Do not promise real-time — CDC pipelines have lag, especially under high write volume or during catch-up after an outage.
 - **The initial historical backfill is a separate, time-consuming step.** Moving years of existing data into the warehouse is not covered by the streaming pipeline. Plan for a dedicated backfill job — this often takes days for large datasets and must be coordinated with the data team before any service DB is decommissioned.
+
+**Schema evolution — the silent CDC killer.**
+
+When Payment Service adds a column to its `payments` table, Debezium picks up the change. But if your ETL pipeline has a hard-coded schema mapping, it will either silently drop the new column or throw a schema mismatch error that nobody sees for three days. This is the most common cause of silent data loss in CDC pipelines.
+
+Two tools solve this: use **Apache Avro or Protobuf with a Confluent Schema Registry** on the Kafka layer to enforce schema compatibility (backward, forward, or full — your choice) before any message is published. Use **dbt (data build tool)** in the warehouse layer to define transformations as version-controlled SQL models that explicitly handle new columns rather than inferring schema from raw CDC events.
+
+```
+Schema-safe CDC pipeline:
+
+  Payment Service DB
+       ↓ Debezium (CDC)
+  Kafka topic: payments.cdc
+       ↓ Schema validated against Confluent Schema Registry
+         (backward-compatible schema changes: allowed; breaking changes: rejected at publish time)
+       ↓ Kafka Streams / Flink consumer
+  Raw warehouse table: payments_raw
+       ↓ dbt model: payments_clean.sql (explicit column mapping, handles nulls for new fields)
+  Analytics table: payments_clean
+       ↓
+  BI queries: SELECT * FROM payments_clean JOIN orders_clean ON ...
+```
+
+A new column in the source DB requires a dbt model update — explicit, reviewed, version-controlled. Not a silent schema drift discovered during a board report.
 
 | Warehouse | Best For |
 |-----------|---------|
@@ -336,6 +377,14 @@ Chatty checkout example:
 
 That is not a performance problem. That is a budget line that appears with no warning after you deploy.
 
+**But before you solve it by co-locating services — ask why you have 50 calls in the first place.**
+
+High egress costs are a symptom. The disease is wrong service boundaries. If a single checkout requires 50 inter-service calls, the checkout domain is fragmented across too many services — each holding a piece of data that should live together. Co-locating those services in the same AZ reduces the bill. It does not fix the architecture. You are still making 50 network calls where 5 should suffice.
+
+The correct first question when you see a chatty service graph is: *which of these services are so frequently coupled that they should be the same service, or share ownership under one team?* If Order Service always needs User, Payment, and Inventory data to respond to a single request, those boundaries may have been drawn by technical layer rather than by domain — exactly the distributed monolith anti-pattern covered in Section 13.
+
+Egress cost is a useful diagnostic tool. When your cloud bill shows a large cross-AZ transfer line item tied to specific service pairs, treat it as an architectural review trigger, not just an infrastructure optimisation task.
+
 **The AZ Topology Diagram**
 
 Here is what a chatty microservices deployment looks like with and without AZ awareness:
@@ -357,7 +406,7 @@ Here is what a chatty microservices deployment looks like with and without AZ aw
   Your checkout: 3 cross-AZ hops × every request × millions of requests = expensive surprise.
 
 
-✅ AZ-Aware Deployment (co-locate chattty services):
+✅ AZ-Aware Deployment (co-locate chatty services):
 
   us-east-1a                                      us-east-1b (failover)
   ┌────────────────────────────────────────┐      ┌────────────────────────────────┐
@@ -627,7 +676,7 @@ Outbox relay (Debezium or custom):
   Marks rows as processed
 ```
 
-Now your event publishing is as reliable as your database write.
+Now your event publishing is as reliable as your database write. However, the Outbox Pattern guarantees **at-least-once delivery** — not exactly-once. If the relay publishes to Kafka but crashes before marking the row as processed, it will publish the same event again on restart. This means every downstream consumer must be idempotent: receiving the same event twice must produce the same result as receiving it once. The idempotency key pattern from the section below applies on the consume side too — store the event ID and skip re-processing if it has already been handled.
 
 ### Idempotency — Safe Retries
 
@@ -644,6 +693,33 @@ POST /payments { amount: 100, idempotency_key: "order-789-attempt-1" }
 ```
 
 Store the `idempotency_key` in your DB. On a duplicate request, return the stored result instead of processing again.
+
+### Idempotent Consumers — Closing the Outbox Loop
+
+The Outbox Pattern guarantees at-least-once delivery. That means every Kafka consumer must also be idempotent. "Store the event ID and skip reprocessing" is the rule — but the implementation detail matters: **the event ID check and the business write must be atomic**, or you get a race condition.
+
+```sql
+-- Wrong: two separate operations — a crash between them causes double-processing
+SELECT * FROM processed_events WHERE event_id = $1;  -- check
+-- crash here → restart → event processed again
+INSERT INTO processed_events (event_id) VALUES ($1);  -- persist
+UPDATE inventory SET reserved = reserved + 1 WHERE item_id = $2;  -- business write
+
+-- Correct: single atomic transaction — idempotency check + business write together
+BEGIN;
+  INSERT INTO processed_events (event_id, processed_at)
+    VALUES ($event_id, NOW())
+    ON CONFLICT (event_id) DO NOTHING;  -- idempotency key; skip if already seen
+
+  IF ROW_COUNT > 0 THEN                 -- only proceed if this is a new event
+    UPDATE inventory SET reserved = reserved + 1 WHERE item_id = $item_id;
+  END IF;
+COMMIT;
+-- If the same event arrives twice, the INSERT hits the conflict clause,
+-- ROW_COUNT = 0, the UPDATE is skipped. Exactly-once semantics from at-least-once delivery.
+```
+
+The `processed_events` table is an append-only deduplication log. Index it on `event_id`. Prune rows older than your maximum retry window (typically 24–72 hours) to keep it from growing unbounded.
 
 ---
 
@@ -757,7 +833,7 @@ Payment Service starts timing out:
   If probe succeeds → circuit closes → normal operation resumes
 ```
 
-Tools: **Resilience4j** (Java), **Polly** (.NET).
+Tools: **Resilience4j** (Java), **Polly** (.NET), **pybreaker** or **circuitbreaker** (Python), **sony/gobreaker** (Go), **opossum** (Node.js).
 
 **Retry with Exponential Backoff**
 
@@ -1098,15 +1174,60 @@ allow {
     "admin" in input.jwt.roles
 }
 
-# Internal service calls must STILL pass a user context — no blanket trust
+# Internal service calls must STILL pass a user context — no blanket trust.
+# IMPORTANT: input.caller_spiffe_id must come from the verified mTLS peer
+# certificate (SPIFFE SVID), NOT from a request header or body field that
+# any caller can set. Wire this from your service mesh or TLS termination layer.
 allow {
-    input.caller_service == "order-service"
+    input.caller_spiffe_id == "spiffe://company.com/service/order-service"
     input.method == "GET"
     input.jwt.sub == input.user_id        # original user context still required
 }
 ```
 
 The policy is the same regardless of which service calls User Service. The check is not "is the caller authenticated?" — it is "does the original user have permission for this specific resource?"
+
+**Test your policies — OPA has a built-in test framework.**
+
+A policy that passes code review can still be logically wrong. Use `opa test` to write unit tests for every policy rule before it ships. Tests live alongside the policy in git and run in CI.
+
+```rego
+# policies/user_profile_test.rego
+
+package authz.user_profile
+
+# Test: user can read their own profile
+test_user_reads_own_profile {
+    allow with input as {
+        "method": "GET",
+        "path": ["users", "user-123", "profile"],
+        "user_id": "user-123",
+        "jwt": {"sub": "user-123", "roles": []}
+    }
+}
+
+# Test: user cannot read another user's profile
+test_user_cannot_read_other_profile {
+    not allow with input as {
+        "method": "GET",
+        "path": ["users", "user-456", "profile"],
+        "user_id": "user-456",
+        "jwt": {"sub": "user-123", "roles": []}   # sub ≠ user_id
+    }
+}
+
+# Test: admin can read any profile
+test_admin_reads_any_profile {
+    allow with input as {
+        "method": "GET",
+        "path": ["users", "user-456", "profile"],
+        "user_id": "user-456",
+        "jwt": {"sub": "admin-1", "roles": ["admin"]}
+    }
+}
+```
+
+Run `opa test ./policies/` in CI. A failing policy test is a security regression. Treat it with the same priority as a failing payment integration test.
 
 **Two deployment patterns:**
 
@@ -1290,7 +1411,14 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --only=production
 COPY . .
+
+# Never run as root in production — flag in every security scan and SOC 2 audit
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+
 EXPOSE 3000
+# Note: implement a /health or /readyz endpoint in your app.
+# K8s liveness and readiness probes depend on it for traffic routing and restart decisions.
 CMD ["node", "server.js"]
 ```
 
@@ -1315,6 +1443,8 @@ Traffic: 100% → Green  (instant switch)
 Issue found? Traffic: 100% → Blue  (instant rollback)
 ```
 
+> ⚠️ **DB note:** Blue and Green share the same database during the switch window. Any schema changes deployed with Green must be backward compatible with Blue — do not rename or drop columns until Blue is fully decommissioned.
+
 **Canary Release** — Route a small percentage of real traffic to the new version. Observe. Gradually increase.
 
 ```
@@ -1324,7 +1454,38 @@ Issue found? Traffic: 100% → Blue  (instant rollback)
 100% → new version
 ```
 
+> ⚠️ **DB note:** Old and new versions run simultaneously against the same database for the entire rollout window. Schema changes must be backward compatible for the duration. Use expand/contract (below) for any additive or destructive schema changes.
+
 **Rolling Deployment** — Replace instances of the old version one at a time. Requires v1 and v2 to be backward compatible during the rollout window.
+
+This compatibility requirement is not trivial when database schema changes are involved. The pattern that makes it safe is called **expand/contract** (also known as parallel change):
+
+```
+❌ Unsafe: rename column and deploy simultaneously
+  Migration: ALTER TABLE orders RENAME COLUMN amount TO total;
+  Deploy: new pods use "total", old pods still expect "amount"
+  Result: old pods start throwing column-not-found errors mid-rollout
+          Partial outage. Emergency rollback. 2am.
+
+✅ Safe: Expand → Migrate → Contract across three deployments
+
+  Step 1 — EXPAND (backward compatible):
+    Migration: ALTER TABLE orders ADD COLUMN total DECIMAL;
+    Deploy v2: writes to BOTH "amount" AND "total". Reads from "amount".
+    Old v1 pods: still reading/writing "amount". Zero breakage.
+
+  Step 2 — MIGRATE (backfill):
+    UPDATE orders SET total = amount WHERE total IS NULL;
+    All rows now have both columns populated.
+    Deploy v2.1: reads from "total". Still writes both.
+
+  Step 3 — CONTRACT (cleanup, weeks later):
+    Confirm zero v1 pods remain in production.
+    Migration: ALTER TABLE orders DROP COLUMN amount;
+    Deploy v2.2: writes "total" only. Old column gone.
+```
+
+The key constraint: **never run a migration that removes or renames a column until you are certain no running pod depends on it.** Your deployment pipeline should enforce a minimum overlap window between expand and contract steps — never same-day.
 
 ### Autoscaling
 
@@ -1483,7 +1644,7 @@ Use this as a checklist. Each phase has clear exit criteria. Never skip one unde
 1. Build the new service. Scope it narrowly — do not over-engineer it.
 2. Set up its CI/CD pipeline. It must deploy independently.
 3. If it needs data, use the shared DB temporarily (see [Section 5](#5-handling-the-shared-database-problem)).
-4. Add OpenTelemetry instrumentation. Ensure correlation IDs flow through all calls.
+4. Add OpenTelemetry **auto-instrumentation** at the deployment layer — attach the OTel agent in the container entrypoint or Helm chart, so it runs for every instance automatically. Do not leave this as a per-developer task in application code; it will be inconsistently applied. Verify that traces flow unbroken across HTTP and Kafka boundaries before proceeding.
 5. Implement circuit breakers and timeouts for all outbound calls.
 6. Write consumer-driven contract tests for every API this service calls or exposes.
 7. Configure JWT validation middleware.
@@ -1685,8 +1846,13 @@ Before any service goes to production:
 - *Monolith to Microservices* — Sam Newman (migration-specific, highly practical)
 - *Designing Distributed Systems* — Brendan Burns (patterns with concrete examples)
 - *Release It!* — Michael Nygard (resilience, circuit breakers, production readiness)
+- *Domain-Driven Design Distilled* — Vaughn Vernon (Bounded Contexts and Aggregates, accessible intro)
 - *Strangler Fig Application* — Martin Fowler, martinfowler.com
 - *SPIFFE/SPIRE* — spiffe.io (workload identity standard and implementation)
 - *Istio Ambient Mesh* — istio.io/docs (sidecar-less mesh, stable since Istio 1.22)
+- *Open Policy Agent* — openpolicyagent.org (policy-as-code, Rego language, `opa test` docs)
+- *Confluent Schema Registry* — docs.confluent.io (Avro/Protobuf schema evolution for Kafka)
 
 ---
+
+*`migrations/monolith-to-microservices.md` · system-design-playbook · v7.0 — Final*
