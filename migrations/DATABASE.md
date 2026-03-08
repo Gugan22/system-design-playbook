@@ -12,16 +12,16 @@ This guide is written for **everyone who touches a database** — from someone w
 > |---|---|
 > | 🟢 **New to databases?** | Start at Section 1. Read everything. |
 > | 🔵 **Junior developer?** | Sections 1–7 give you a solid foundation. |
-> | 🟡 **Mid-level engineer?** | Sections 2–13 are your core reference. |
-> | 🔴 **Senior / Tech Lead?** | Sections 14–21 are where the advanced nuance lives. |
+> | 🟡 **Mid-level engineer?** | Sections 2–14 are your core reference. |
+> | 🔴 **Senior / Tech Lead?** | Sections 18–25 are where the advanced nuance lives. |
 
 ---
 
 ## ⚡ Key Points — Read This First
 
-Before diving into any section, internalise these 12 principles. Every pattern in this document flows from them. If you read nothing else, read this table.
+Before diving into any section, internalise these 18 principles. Every pattern in this document flows from them. If you read nothing else, read this table.
 
-> **🔑 The 12 Laws of Safe Migration**
+> **🔑 The 18 Laws of Safe Migration**
 >
 > | # | Law | What Happens If You Break It |
 > |---|---|---|
@@ -37,6 +37,30 @@ Before diving into any section, internalise these 12 principles. Every pattern i
 > | 10 | **Use `NOT VALID` + `VALIDATE CONSTRAINT` for foreign keys (PostgreSQL).** | A plain `ADD CONSTRAINT FOREIGN KEY` on a large table scans every row with an `AccessExclusiveLock`, blocking all reads and writes for the entire scan duration. |
 > | 11 | **Every migration gets a version number and is immutable.** | Editing a migration that already ran in any environment means your history is a lie — you can no longer reproduce or audit the schema state. |
 > | 12 | **Monitor replication lag throughout every migration.** | Heavy writes cause replicas to fall behind. Read-replicas silently serve stale data — users see missing orders, wrong balances, vanished records — with no errors in the logs. |
+> | 13 | **Set `lock_timeout` before every DDL statement.** | A waiting `ALTER TABLE` queues behind the blocking query and then blocks every subsequent query behind itself — a cascade that can fill your connection pool in 30 seconds. |
+> | 14 | **Monitor dead tuples and autovacuum health during any backfill.** | Every `UPDATE` creates a dead tuple. If autovacuum cannot keep up, a "safe" backfill produces index and table bloat that silently kills query performance long after the migration finishes. |
+> | 15 | **Track your column count and transaction ID horizon.** | Dropped columns still count toward PostgreSQL's 1,600-column limit until `VACUUM FULL` runs. Aggressive or long-running migrations can accelerate TXID wraparound — a hard limit that shuts the database down entirely. |
+> | 16 | **Never modify an ENUM type inside a transaction block.** | `ALTER TYPE ... ADD VALUE` cannot execute inside `BEGIN/COMMIT` in PostgreSQL. If your migration runner wraps all statements in a transaction, the entire deployment will fail with a hard error. Removing or renaming an ENUM value requires replacing the type entirely — which cannot be done online without a full Expand/Contract cycle. |
+> | 17 | **Define sentinel values before any JSONB-to-column backfill.** | Using `NULL` as the "not yet migrated" marker fails when business logic already uses `NULL` to mean "intentionally empty." Without a distinct sentinel, your backfill silently overwrites intentional data — and the divergence check cannot tell the difference. |
+> | 18 | **Tune `autovacuum_work_mem` for the migration window on backfill-heavy tables.** | The default `autovacuum_work_mem` (-1, inheriting `maintenance_work_mem`) may be insufficient for processing millions of dead tuples quickly. An under-resourced vacuum runs slowly, the TXID horizon closes in, and the database shuts down — regardless of how well-batched the backfill itself was. |
+
+---
+
+## ⚠️ Migration Failure Statistics — Know Before You Start
+
+These figures represent observed failure rates in large production systems. Senior engineers and tech leads should use them to calibrate risk thresholds and approval gates.
+
+| Migration Failure Cause | Root Cause | Est. Frequency in Large Systems | Recovery Difficulty |
+|---|---|---|---|
+| **Replication Lag / Stale Reads** | Backfill writes outpacing replica replay | ~35% of backfills | Low (wait it out, or pause backfill) |
+| **N+1 Rollback Failure** (old app + new schema conflict) | Phase 3 dropped while old pods still running | ~22% of rapid deploys | High (risk of data corruption) |
+| **Index Bloat / Disk Exhaustion** | Dead tuples from backfill + slow autovacuum | ~15% of high-volume migrations | Moderate (`REINDEX CONCURRENTLY`) |
+| **Connection Pool Saturation** | `lock_timeout` not set; DDL queues silently | High impact when it occurs | **Total site outage (0% availability)** |
+| **Catalog Bloat** | Constant Expand/Contract cycles without `VACUUM FULL` | Accumulates silently over months | Slows every query on that table; fix requires downtime |
+| **WAL Disk Full** | Long-running backfill + high write traffic + replication slots | Uncommon but sudden | DB goes read-only or crashes; requires immediate intervention |
+| **TXID Wraparound / Vacuum Issues** | Aggressive backfill + under-resourced autovacuum | <1% (but catastrophic) | Extreme (requires single-user mode downtime) |
+
+> **💡 Connection pool saturation deserves the same urgency as replication lag — a single `ALTER TABLE` waiting on a lock with no `lock_timeout` can render a site completely unavailable in under 60 seconds. The 22% rollback failure rate is why Law #4 — N and N-1 compatibility — is non-negotiable.**
 
 ---
 
@@ -60,20 +84,24 @@ Before diving into any section, internalise these 12 principles. Every pattern i
 11. [Replication Impact](#11-replication-impact)
 12. [Disk Space During Migrations](#12-disk-space-during-migrations)
 13. [Lock Diagnostics](#13-lock-diagnostics)
+14. [VACUUM, Bloat, and Transaction ID Wraparound](#14-vacuum-bloat-and-transaction-id-wraparound)
+15. [JSONB to Structured Column Migrations](#15-jsonb-to-structured-column-migrations) ⬅️ *new*
+16. [ENUM Type Migrations](#16-enum-type-migrations) ⬅️ *new*
+17. [Sentinel Values in Dual-Write Migrations](#17-sentinel-values-in-dual-write-migrations) ⬅️ *new*
 
 **Systems & Infrastructure**
-14. [Versioned Migration System](#14-versioned-migration-system)
-15. [Central Migration Registry](#15-central-migration-registry)
-16. [Migration Runner](#16-migration-runner)
-17. [Infrastructure-Level Migrations](#17-infrastructure-level-migrations)
+18. [Versioned Migration System](#18-versioned-migration-system)
+19. [Central Migration Registry](#19-central-migration-registry)
+20. [Migration Runner](#20-migration-runner)
+21. [Infrastructure-Level Migrations](#21-infrastructure-level-migrations)
 
 **Tooling**
-18. [Migration Tooling — The Full Landscape](#18-migration-tooling--the-full-landscape)
+22. [Migration Tooling — The Full Landscape](#22-migration-tooling--the-full-landscape)
 
 **Reference**
-19. [Migration Runbook Template](#19-migration-runbook-template)
-20. [What Goes Wrong — Four Patterns From Production](#20-what-goes-wrong--four-patterns-from-production)
-21. [Quick Reference — Pre-Migration Checklist](#21-quick-reference--pre-migration-checklist)
+23. [Migration Runbook Template](#23-migration-runbook-template)
+24. [What Goes Wrong — Six Patterns From Production](#24-what-goes-wrong--six-patterns-from-production)
+25. [Quick Reference — Pre-Migration Checklist](#25-quick-reference--pre-migration-checklist)
 
 ---
 
@@ -161,6 +189,32 @@ On a small table (10,000 rows), the lock is held for a fraction of a second — 
 >
 > The fix is not faster SQL. The fix is to **never do this in one shot on a large live table**.
 
+### The "Ghost Column" Limit
+
+Before adopting Expand/Contract as a long-term practice, teams must understand one structural limit in PostgreSQL: **a table can have at most 1,600 columns**. The critical catch is that **dropped columns still count toward this limit** until a `VACUUM FULL` is run — which requires an `AccessExclusiveLock` and is effectively a full-table rewrite.
+
+> **⚠️ The Risk for Expand/Contract Teams**
+>
+> If your team applies the Contract phase 50+ times to the same table, you may eventually find you cannot add any new columns — even though only a fraction of those 1,600 slots are visibly occupied. The only fix is `VACUUM FULL`, which blocks all reads and writes for the entire duration of the table rewrite (potentially hours on a large table).
+>
+> ```sql
+> -- Check how many columns (including dropped) a table is consuming
+> SELECT COUNT(*) AS total_column_slots
+> FROM pg_attribute
+> WHERE attrelid = 'users'::regclass
+>   AND attnum > 0;         -- attnum > 0 filters out system columns
+> -- attisdropped = TRUE columns count toward the 1,600 limit
+>
+> -- See which slots are dropped
+> SELECT attname, attisdropped
+> FROM pg_attribute
+> WHERE attrelid = 'users'::regclass
+>   AND attnum > 0
+> ORDER BY attnum;
+> ```
+>
+> **Rule of thumb:** If your column slot count approaches 1,200 (giving a buffer of 400), schedule a `VACUUM FULL` during a planned maintenance window before it becomes urgent.
+
 ### The Expand/Contract Pattern
 
 Expand/Contract breaks one dangerous migration into **three small, safe steps**. Each step is independently deployable. Each holds a lock for at most a millisecond.
@@ -178,24 +232,9 @@ Add the new column as **nullable** (`NULL` is allowed). This is safe because:
 ```sql
 -- ✅ SAFE on any size table — no row rewrite, no extended lock
 ALTER TABLE users ADD COLUMN verified_at TIMESTAMP NULL;
-
--- Why NULL and not NOT NULL?
--- NOT NULL with DEFAULT NOW() would force a full row rewrite on older PostgreSQL versions.
--- NULL means "this column can be empty" — existing rows simply have NULL here.
 ```
 
-At the same time, update the application to **write to both the old and new columns** on every relevant operation (the Dual-Write pattern — covered fully in [Section 4](#4-dual-write-strategy-for-critical-data)):
-
-```python
-# After deploying Phase 1, new writes populate both columns
-def verify_user(user_id):
-    db.execute("""
-        UPDATE users
-        SET is_verified = TRUE,    -- old column — keep writing for now
-            verified_at = NOW()    -- new column — start populating
-        WHERE id = %s
-    """, (user_id,))
-```
+At the same time, update the application to **write to both the old and new columns** on every relevant operation (the Dual-Write pattern — covered fully in [Section 4](#4-dual-write-strategy-for-critical-data)).
 
 > **💡 Tip:** Deploy Phase 1 and let it run for at least 24 hours before moving to Phase 2. You want new writes to have been populating the new column long enough to validate the behaviour before starting the backfill.
 
@@ -203,7 +242,7 @@ def verify_user(user_id):
 
 #### 🟡 Phase 2: MIGRATE — Backfill Existing Rows
 
-Existing rows still have `NULL` in the new column. Run a **background job** to populate them without downtime. See [Section 5](#5-backfill-patterns-without-locking-tables) for the full safe batched backfill pattern.
+Existing rows still have `NULL` in the new column. Run a **background job** to populate them without downtime. See [Section 5](#5-backfill-patterns-without-locking-tables) for the full safe batched backfill pattern and [Section 14](#14-vacuum-bloat-and-transaction-id-wraparound) for how to monitor dead-tuple bloat throughout.
 
 Once the backfill completes, run a **divergence check** to verify the data is correct, then flip the application to read from the new column.
 
@@ -223,6 +262,8 @@ ALTER TABLE users DROP COLUMN is_verified;
 ALTER TABLE users ALTER COLUMN verified_at SET NOT NULL;
 -- PostgreSQL 11+: this is a catalog-only change — no row rewrite, no long lock
 ```
+
+> **⚠️ Remember:** The dropped `is_verified` column still occupies a column slot. Track cumulative dropped columns on frequently-migrated tables (see the Ghost Column Limit above).
 
 ---
 
@@ -275,35 +316,25 @@ Think of it like forwarding your mail when you move house. During the transition
 
 > **📘 Real Example: An e-commerce order service migrating how it stores delivery addresses**
 >
-> **Old design:** A single `delivery_address` text column — a free-form string like `"42 Elm Street, London, UK"`.
+> **Old design:** A single `delivery_address` text column.
 >
-> **New design:** Three structured columns — `delivery_street`, `delivery_city`, `delivery_country` — enabling fast queries like "show all orders in Germany" without parsing free text.
+> **New design:** Three structured columns — `delivery_street`, `delivery_city`, `delivery_country`.
 >
-> With 8 million existing orders in the old format, the dual-write solution:
->
-> **Step 1 (Expand):** Add the three new nullable columns. Deploy code that writes to all four:
 > ```python
 > def place_order(order):
 >     db.execute("""
 >         INSERT INTO orders (
->             delivery_address,    -- old column — keep writing
+>             delivery_address,
 >             delivery_street, delivery_city, delivery_country
 >         ) VALUES (%s, %s, %s, %s)
 >     """, (order.full_address, order.street, order.city, order.country))
 > ```
->
-> **Step 2 (Backfill):** Background job parses `delivery_address` for all 8 million existing rows.
->
-> **Step 3 (Read cutover):** After divergence check passes, switch app to read from new columns. Old column still written as safety net.
->
-> **Step 4 (Contract):** After a week of clean reads, drop `delivery_address`.
 
 ### Controlling Dual-Write With Feature Flags
 
 Feature flags let you control dual-write without a code deployment — ramp from 5% → 50% → 100% of writes, or kill it instantly if something looks wrong.
 
 ```sql
--- A simple feature flags table — no external tool needed to start
 CREATE TABLE feature_flags (
     flag_name   VARCHAR(100) PRIMARY KEY,
     is_enabled  BOOLEAN      DEFAULT FALSE,
@@ -314,41 +345,20 @@ CREATE TABLE feature_flags (
 INSERT INTO feature_flags (flag_name, is_enabled, description) VALUES
     ('dual_write_order_address_v2', FALSE, 'Write to new delivery address columns'),
     ('read_from_order_address_v2',  FALSE, 'Read from new delivery address columns');
-
--- Toggle without a deployment:
-UPDATE feature_flags SET is_enabled = TRUE
-WHERE flag_name = 'dual_write_order_address_v2';
 ```
 
 ```python
-def is_feature_enabled(flag_name: str) -> bool:
-    result = db.execute(
-        "SELECT is_enabled FROM feature_flags WHERE flag_name = %s", (flag_name,)
-    ).fetchone()
-    return bool(result["is_enabled"]) if result else False
-
 class OrderRepository:
     def save_order(self, order):
-        self._write_legacy_address(order)                        # always write old
+        self._write_legacy_address(order)
         if is_feature_enabled("dual_write_order_address_v2"):
-            self._write_new_address_columns(order)               # write new when flag is on
+            self._write_new_address_columns(order)
 
     def get_order(self, order_id):
         if is_feature_enabled("read_from_order_address_v2"):
-            return self._read_new_address_columns(order_id)      # read new when verified
-        return self._read_legacy_address(order_id)               # default: old
+            return self._read_new_address_columns(order_id)
+        return self._read_legacy_address(order_id)
 ```
-
-> **💡 Tip:** A database flag table is completely sufficient for migration feature flags. The goal is to flip a switch without a deployment — a `UPDATE feature_flags SET is_enabled = TRUE` achieves exactly that.
-
-For teams that grow beyond this, dedicated tools offer targeting rules, audit logs, and percentage rollouts:
-
-| Tool | Type | When to Graduate To It |
-|---|---|---|
-| **LaunchDarkly** | Managed SaaS | Large teams needing real-time targeting and rollout controls |
-| **Unleash** | Open source, self-hosted | Full control with no vendor dependency |
-| **Flagsmith** | Open source or managed | Easy self-hosting; good middle ground |
-| **AWS AppConfig** | Managed | Teams already on AWS wanting zero extra infrastructure |
 
 ### The Four States of a Dual-Write Migration
 
@@ -363,19 +373,8 @@ Move through these states strictly in order. **Never skip ahead.**
 
 ### Consistency During Dual-Write — What Can Actually Go Wrong
 
-Between the write to the old location and the write to the new location, there is a brief window where both stores have different data. In most cases this is milliseconds and harmless. But depending on your data type, it can cost real money and real users.
-
-> **📘 Scenario 1: Bank balance — the inconsistency that costs real money**
+> **📘 Scenario 1: Bank balance — wrap both writes in one transaction**
 >
-> Old schema: `balance` column. New schema: `account_ledger` table with a running total. During dual-write:
->
-> - `balance` updated to £1,500 (£500 withdrawal from £2,000)
-> - Milliseconds later: a second concurrent request reads from `account_ledger` — which still shows £2,000
-> - Second £500 withdrawal approved against the stale £2,000
->
-> Result: Two £500 withdrawals went through. Account is now £1,000 but should be £1,500.
->
-> **Fix:** Wrap both writes in one transaction so they are atomic:
 > ```python
 > with db.transaction():
 >     db.execute(
@@ -388,24 +387,18 @@ Between the write to the old location and the write to the new location, there i
 >     )
 > ```
 
-> **📘 Scenario 2: Session migration — the inconsistency that logs users out**
+> **📘 Scenario 2: Session migration — fall back to old location on a miss**
 >
-> Migrating sessions from a `sessions` table to Redis. A user logs in — session written to both. Their next request hits a different app server with a 200ms Redis replication lag. Redis returns "session not found". User is logged out immediately after logging in. No errors in the logs. The code is correct. The problem is a consistency window created by replication lag.
->
-> **Fix:** Fall back to the old location if the new one misses:
 > ```python
 > def get_session(session_id: str):
->     session = redis.get(session_id)             # try new location first
+>     session = redis.get(session_id)
 >     if session is None:
->         session = db.query_session(session_id)  # fall back to old
+>         session = db.query_session(session_id)
 >     return session
 > ```
 
-> **📘 Scenario 3: Cache serving stale schema — the silent wrong answer**
+> **📘 Scenario 3: Cache serving stale schema — invalidate on every write**
 >
-> Migrating `product_price` to a new `pricing` table. Redis cache was populated before migration. New code reads from `pricing` table — but cache intercepts first, returning the old price. Cache TTL is 1 hour. For up to 1 hour after cutover, users see wrong prices. No error thrown. No alert fires.
->
-> **Fix:** Invalidate the cache on every write, regardless of which path is primary:
 > ```python
 > def update_price(product_id: int, new_price: float):
 >     db.execute("UPDATE products SET product_price = %s WHERE id = %s", (new_price, product_id))
@@ -414,7 +407,7 @@ Between the write to the old location and the write to the new location, there i
 >         "ON CONFLICT (product_id) DO UPDATE SET price = EXCLUDED.price",
 >         (product_id, new_price)
 >     )
->     cache.delete(f"product:{product_id}")    # invalidate on EVERY write
+>     cache.delete(f"product:{product_id}")
 > ```
 
 ### What To Monitor During Dual-Write
@@ -435,60 +428,268 @@ A backfill populates data in the new column or table for rows that **existed bef
 
 > **🚨 Never Do This on a Large Live Table:**
 > ```sql
-> -- This will lock the table for minutes on large datasets
 > UPDATE users SET verified_at = created_at WHERE verified_at IS NULL;
 > ```
-> On 50M rows this locks the table, spikes CPU, saturates replication lag, and causes an outage.
+> On 50M rows this locks the table, spikes CPU, saturates replication lag, and causes an outage. It also creates 50M dead tuples — see [Section 14](#14-vacuum-bloat-and-transaction-id-wraparound) for why that matters.
 
-### The Safe Pattern: Batch + Throttle + Cursor
+### The Safe Pattern: Adaptive Backfill with Live Health Checks
 
-Process rows in small batches with a brief pause between each. This keeps individual transactions short and gives the database — and its replicas — time to breathe.
+A fixed sleep between batches is a blunt instrument. It does not respond to what the database is actually experiencing — a healthy system is throttled unnecessarily, a struggling system is not throttled enough. The production-grade pattern measures four health signals before every batch and adjusts pace dynamically.
+
+The four signals checked before each batch:
+
+- **Replication lag** — if replicas are falling behind, reads served from them are stale
+- **WAL disk pressure** — if retained WAL is growing, the primary may be approaching read-only mode
+- **Dead-tuple accumulation** — if autovacuum cannot keep pace, index and table bloat is building silently
+- **Active lock contention** — if other sessions are waiting on locks against the target table, a batch now will extend those waits
 
 ```python
 import time
+import dataclasses
+from typing import Optional
 
-def run_backfill(db):
-    BATCH_SIZE = 1_000    # rows per batch — start small, increase if DB stays healthy
-    SLEEP_SECS = 0.05     # 50ms pause between batches
-    last_id    = 0
-    total_done = 0
+@dataclasses.dataclass
+class BackfillHealth:
+    """Snapshot of database health metrics relevant to backfill safety."""
+    replication_lag_s:  float   # seconds; 0.0 if no replicas
+    wal_retained_gb:    float   # GB of WAL retained by slowest replication slot
+    dead_tup_pct:       float   # dead tuples as % of live + dead on target table
+    lock_waiters:       int     # sessions currently waiting on a lock on the target table
 
-    while True:
-        # Keyset pagination — always resumes exactly where we left off
-        rows = db.execute("""
-            SELECT id FROM users
-            WHERE verified_at IS NULL
-              AND id > %(last_id)s
-            ORDER BY id ASC
-            LIMIT %(batch_size)s
-        """, {"last_id": last_id, "batch_size": BATCH_SIZE}).fetchall()
+class AdaptiveBackfill:
+    """
+    Runs a batched backfill with per-batch health checks and dynamic throttling.
 
-        if not rows:
-            print(f"Backfill complete — {total_done:,} rows updated.")
-            break
+    Throttle levels (evaluated in priority order):
+      PAUSE   — health critical; stop and wait until resolved
+      SLOW    — health degraded; reduce batch size and increase sleep
+      NORMAL  — health acceptable; run at configured pace
+      FAST    — all signals green; can push slightly harder if desired
 
-        ids = [row["id"] for row in rows]
+    Usage:
+        backfill = AdaptiveBackfill(db, table="users", id_column="id",
+                                    update_sql=UPDATE_SQL, progress_key="backfill_verified_at")
+        backfill.run()
+    """
 
-        result = db.execute("""
-            UPDATE users
-            SET verified_at = created_at
-            WHERE id = ANY(%(ids)s)
-              AND verified_at IS NULL    -- idempotency guard: skip already-done rows
-        """, {"ids": ids})
+    # ── Thresholds ────────────────────────────────────────────────────────────
+    PAUSE_REPLICATION_LAG_S  = 30.0   # pause if any replica is >30s behind
+    SLOW_REPLICATION_LAG_S   =  5.0   # slow down if any replica is >5s behind
+    PAUSE_WAL_RETAINED_GB    = 20.0   # pause if slowest slot retains >20 GB of WAL
+    SLOW_WAL_RETAINED_GB     =  5.0   # slow down if >5 GB retained
+    PAUSE_DEAD_TUP_PCT       = 40.0   # pause if >40% of rows are dead tuples
+    SLOW_DEAD_TUP_PCT        = 20.0   # slow down if >20% dead tuples
+    PAUSE_LOCK_WAITERS       =  5     # pause if 5+ sessions waiting on target table locks
 
-        total_done += result.rowcount
-        last_id     = ids[-1]
-        time.sleep(SLEEP_SECS)
-        print(f"  {total_done:,} rows done, last id = {last_id}")
+    # ── Batch parameters per throttle level ──────────────────────────────────
+    BATCH_PARAMS = {
+        "FAST":   {"size": 2_000, "sleep_s": 0.01},
+        "NORMAL": {"size": 1_000, "sleep_s": 0.05},
+        "SLOW":   {"size":   250, "sleep_s": 0.50},
+        "PAUSE":  {"size":     0, "sleep_s": 15.0},   # size=0 skips the batch
+    }
+
+    def __init__(self, db, table: str, id_column: str, update_sql: str,
+                 progress_key: str, start_id: int = 0):
+        self.db           = db
+        self.table        = table
+        self.id_col       = id_column
+        self.update_sql   = update_sql   # must accept %(ids)s and include idempotency guard
+        self.progress_key = progress_key
+        self.last_id      = start_id
+        self.total_done   = 0
+        self._ensure_progress_table()
+
+    # ── Health sampling ───────────────────────────────────────────────────────
+
+    def _sample_health(self) -> BackfillHealth:
+        lag_row = self.db.execute("""
+            SELECT COALESCE(
+                EXTRACT(EPOCH FROM MAX(replay_lag)), 0
+            ) AS lag_s
+            FROM pg_stat_replication
+        """).fetchone()
+
+        wal_row = self.db.execute("""
+            SELECT COALESCE(
+                MAX(
+                    pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)
+                ) / 1073741824.0,   -- bytes -> GB
+                0.0
+            ) AS retained_gb
+            FROM pg_replication_slots
+            WHERE active = TRUE
+        """).fetchone()
+
+        bloat_row = self.db.execute("""
+            SELECT
+                CASE
+                    WHEN n_live_tup + n_dead_tup = 0 THEN 0.0
+                    ELSE ROUND(
+                        n_dead_tup::DECIMAL / (n_live_tup + n_dead_tup) * 100, 1
+                    )
+                END AS dead_pct
+            FROM pg_stat_user_tables
+            WHERE relname = %(table)s
+        """, {"table": self.table}).fetchone()
+
+        lock_row = self.db.execute("""
+            SELECT COUNT(*) AS waiters
+            FROM pg_locks l
+            JOIN pg_stat_activity a USING (pid)
+            WHERE l.relation = %(table)s::regclass
+              AND l.granted  = FALSE
+        """, {"table": self.table}).fetchone()
+
+        return BackfillHealth(
+            replication_lag_s = float(lag_row["lag_s"]          or 0),
+            wal_retained_gb   = float(wal_row["retained_gb"]     or 0),
+            dead_tup_pct      = float(bloat_row["dead_pct"]      or 0) if bloat_row else 0.0,
+            lock_waiters      = int(lock_row["waiters"]           or 0),
+        )
+
+    def _throttle_level(self, h: BackfillHealth) -> str:
+        if (h.replication_lag_s >= self.PAUSE_REPLICATION_LAG_S or
+                h.wal_retained_gb   >= self.PAUSE_WAL_RETAINED_GB   or
+                h.dead_tup_pct      >= self.PAUSE_DEAD_TUP_PCT       or
+                h.lock_waiters      >= self.PAUSE_LOCK_WAITERS):
+            return "PAUSE"
+        if (h.replication_lag_s >= self.SLOW_REPLICATION_LAG_S or
+                h.wal_retained_gb   >= self.SLOW_WAL_RETAINED_GB    or
+                h.dead_tup_pct      >= self.SLOW_DEAD_TUP_PCT):
+            return "SLOW"
+        # All signals green
+        return "NORMAL"
+
+    def _log_health(self, level: str, h: BackfillHealth) -> None:
+        print(
+            f"  [{level:6s}] lag={h.replication_lag_s:.1f}s  "
+            f"wal={h.wal_retained_gb:.2f}GB  "
+            f"dead={h.dead_tup_pct:.1f}%  "
+            f"lock_waiters={h.lock_waiters}  "
+            f"done={self.total_done:,}  last_id={self.last_id}"
+        )
+
+    # ── Progress persistence ──────────────────────────────────────────────────
+
+    def _ensure_progress_table(self) -> None:
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS backfill_jobs (
+                job_name          VARCHAR(100) PRIMARY KEY,
+                last_processed_id BIGINT       DEFAULT 0,
+                total_processed   BIGINT       DEFAULT 0,
+                status            VARCHAR(20)  DEFAULT 'running',
+                started_at        TIMESTAMP    DEFAULT NOW(),
+                updated_at        TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        # Resume from last checkpoint if this job was interrupted
+        row = self.db.execute(
+            "SELECT last_processed_id, total_processed FROM backfill_jobs WHERE job_name = %s",
+            (self.progress_key,)
+        ).fetchone()
+        if row:
+            self.last_id    = row["last_processed_id"]
+            self.total_done = row["total_processed"]
+            print(f"Resuming from id={self.last_id} ({self.total_done:,} rows already done)")
+
+    def _save_progress(self) -> None:
+        self.db.execute("""
+            INSERT INTO backfill_jobs (job_name, last_processed_id, total_processed)
+            VALUES (%(key)s, %(last_id)s, %(done)s)
+            ON CONFLICT (job_name) DO UPDATE
+            SET last_processed_id = EXCLUDED.last_processed_id,
+                total_processed   = EXCLUDED.total_processed,
+                updated_at        = NOW()
+        """, {"key": self.progress_key, "last_id": self.last_id, "done": self.total_done})
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        print(f"Starting adaptive backfill on '{self.table}' from id={self.last_id}")
+        consecutive_pauses = 0
+
+        while True:
+            health = self._sample_health()
+            level  = self._throttle_level(health)
+            params = self.BATCH_PARAMS[level]
+            self._log_health(level, health)
+
+            if level == "PAUSE":
+                consecutive_pauses += 1
+                if consecutive_pauses >= 10:
+                    # 10 consecutive pauses (2.5 minutes) = something is structurally wrong
+                    self._save_progress()
+                    raise RuntimeError(
+                        f"Backfill suspended after {consecutive_pauses} consecutive PAUSE "
+                        f"cycles. Last health: {health}. Investigate before resuming."
+                    )
+                time.sleep(params["sleep_s"])
+                continue
+
+            consecutive_pauses = 0
+
+            # Fetch next batch of IDs
+            rows = self.db.execute(f"""
+                SELECT {self.id_col} AS id FROM {self.table}
+                WHERE verified_at IS NULL
+                  AND {self.id_col} > %(last_id)s
+                ORDER BY {self.id_col} ASC
+                LIMIT %(batch_size)s
+            """, {"last_id": self.last_id, "batch_size": params["size"]}).fetchall()
+
+            if not rows:
+                self.db.execute(
+                    "UPDATE backfill_jobs SET status = 'complete', updated_at = NOW() "
+                    "WHERE job_name = %s", (self.progress_key,)
+                )
+                print(f"Backfill complete — {self.total_done:,} rows updated.")
+                return
+
+            ids    = [r["id"] for r in rows]
+            result = self.db.execute(self.update_sql, {"ids": ids})
+
+            self.total_done += result.rowcount
+            self.last_id     = ids[-1]
+            self._save_progress()
+            time.sleep(params["sleep_s"])
+
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+
+UPDATE_SQL = """
+    UPDATE users
+    SET verified_at = created_at
+    WHERE id = ANY(%(ids)s)
+      AND verified_at IS NULL    -- idempotency guard: skip already-processed rows
+"""
+
+# db must be a connection object whose .execute() returns a result with .rowcount
+backfill = AdaptiveBackfill(
+    db           = db,
+    table        = "users",
+    id_column    = "id",
+    update_sql   = UPDATE_SQL,
+    progress_key = "backfill_verified_at",
+)
+backfill.run()
 ```
 
 > **📘 Why keyset pagination (`id > last_id`) instead of `OFFSET`?**
->
-> `LIMIT 1000 OFFSET 5000` has a subtle bug: as the backfill updates rows, the `OFFSET` calculation shifts — you skip rows or re-process them. `id > last_id` always resumes from exactly the last row processed regardless of what happened behind it. It is also significantly faster because PostgreSQL satisfies it using the primary key index rather than scanning and discarding rows.
+> `LIMIT 1000 OFFSET 5000` shifts as rows are updated during the backfill, causing rows to be skipped or re-processed. `id > last_id` always resumes from exactly the last processed row regardless of concurrent updates, and is significantly faster via the primary key index.
+
+### What Each Health Signal Protects Against
+
+| Signal | Threshold → SLOW | Threshold → PAUSE | What Goes Wrong If Ignored |
+|---|---|---|---|
+| **Replication lag** | > 5s | > 30s | Read-replicas serve stale data — wrong balances, missing records, no errors in logs |
+| **WAL retained (GB)** | > 5GB | > 20GB | Disk fills on primary; database enters read-only mode or crashes |
+| **Dead tuple %** | > 20% | > 40% | Index and table bloat silently degrades query performance long after migration ends |
+| **Lock waiters** | — | ≥ 5 sessions | Running a batch now extends lock waits for all queued sessions — connection pool cascade |
 
 ### Tuning the Backfill
 
-Start at the conservative settings. Increase only if monitoring shows the database remains healthy (CPU < 70%, replication lag < 1s).
+The defaults above are conservative starting points. Increase batch size only after confirming all four signals remain healthy for at least 15 minutes at the current setting.
 
 | Setting | Conservative (Start Here) | Moderate | Aggressive |
 |---|---|---|---|
@@ -496,6 +697,8 @@ Start at the conservative settings. Increase only if monitoring shows the databa
 | Sleep between batches | 100ms | 25–50ms | 0–10ms |
 | Run during | Off-peak hours | Any time | Any time |
 | Replication lag tolerance | < 1s | < 5s | < 30s |
+
+> **⚠️ Watch Out:** Each batch creates dead tuples. At aggressive settings, autovacuum may not keep up. Monitor `n_dead_tup` during the backfill — see [Section 14](#14-vacuum-bloat-and-transaction-id-wraparound).
 
 ### Tracking Backfill Progress
 
@@ -505,11 +708,10 @@ CREATE TABLE backfill_jobs (
     started_at        TIMESTAMP,
     last_processed_id BIGINT  DEFAULT 0,
     total_processed   BIGINT  DEFAULT 0,
-    status            VARCHAR(20) DEFAULT 'running',  -- running | paused | complete
+    status            VARCHAR(20) DEFAULT 'running',
     updated_at        TIMESTAMP   DEFAULT NOW()
 );
 
--- Check percentage complete
 SELECT
     total_processed,
     (SELECT COUNT(*) FROM users WHERE verified_at IS NULL) AS remaining,
@@ -528,45 +730,15 @@ WHERE job_name = 'backfill_verified_at';
 
 ### What Does Idempotent Mean?
 
-An idempotent migration produces **the same result whether it runs once or ten times**. If it runs, crashes, and runs again — nothing breaks. No duplicate data. No constraint violations. No errors on re-run.
-
-This is non-negotiable. Migrations fail in production. Network timeouts happen. Deployment systems restart mid-run. A non-idempotent migration that crashes halfway can leave the database in a state where the re-run fails with a *different* error — turning a recoverable failure into a crisis requiring manual intervention.
-
-> **📘 Real Example: Non-idempotent vs idempotent**
->
-> **Non-idempotent — dangerous:**
-> ```sql
-> -- If this crashes after inserting 50K rows and you re-run it,
-> -- every already-inserted row fails with a duplicate key violation.
-> INSERT INTO user_preferences (user_id, default_theme)
-> SELECT id, 'light' FROM users;
-> ```
->
-> **Idempotent — safe to re-run:**
-> ```sql
-> -- ON CONFLICT DO NOTHING skips rows that already exist
-> INSERT INTO user_preferences (user_id, default_theme)
-> SELECT id, 'light' FROM users
-> ON CONFLICT (user_id) DO NOTHING;
-> ```
-
-### Making Every Migration Type Idempotent
+An idempotent migration produces **the same result whether it runs once or ten times**. Migrations fail in production — network timeouts, deployment restarts mid-run. A non-idempotent migration that crashes halfway can leave the database in a state where the re-run fails with a *different* error — turning a recoverable failure into a crisis.
 
 **Table creation:**
 ```sql
--- ❌ Fails if table already exists
-CREATE TABLE subscriptions (...);
-
--- ✅ Safe to run multiple times
 CREATE TABLE IF NOT EXISTS subscriptions (...);
 ```
 
 **Column addition (PostgreSQL):**
 ```sql
--- ❌ Fails if column already exists
-ALTER TABLE users ADD COLUMN verified_at TIMESTAMP NULL;
-
--- ✅ Guard with information_schema check
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -578,18 +750,12 @@ BEGIN
 END $$;
 ```
 
-**Column addition (MySQL):**
-```sql
--- ✅ MySQL 8.0+ supports IF NOT EXISTS directly
-ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_at DATETIME NULL;
-```
-
 **Index creation:**
 ```sql
--- ✅ PostgreSQL — idempotent and non-locking
+-- PostgreSQL
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_users_email ON users(email);
 
--- ✅ MySQL — idempotent with non-locking algorithm
+-- MySQL
 ALTER TABLE users
 ADD INDEX IF NOT EXISTS idx_users_email (email)
 ALGORITHM=INPLACE, LOCK=NONE;
@@ -597,16 +763,12 @@ ALGORITHM=INPLACE, LOCK=NONE;
 
 **Data migration / backfill:**
 ```sql
--- ❌ Re-runs update rows already processed (wasted work, potential side effects)
-UPDATE users SET verified_at = created_at;
-
 -- ✅ Skips already-processed rows
 UPDATE users SET verified_at = created_at WHERE verified_at IS NULL;
 ```
 
 **Constraint addition (PostgreSQL):**
 ```sql
--- ✅ Idempotent + safe (NOT VALID avoids the full-table scan lock — see Section 10)
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -617,18 +779,12 @@ BEGIN
         FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;
     END IF;
 END $$;
--- Follow with separately: ALTER TABLE orders VALIDATE CONSTRAINT fk_user;
+ALTER TABLE orders VALIDATE CONSTRAINT fk_user;
 ```
 
 ### Why You Cannot Rely Solely on the Migration Runner
 
-Migration runners track applied migrations in a history table. But this protection breaks down when:
-
-- A migration **partially ran** and the runner crashed — it is not in the history table, so it re-runs from the beginning
-- The **history table was manually edited or lost**
-- Two nodes **race** to apply the same migration simultaneously (before advisory locking fires)
-
-Write every migration as if the runner might execute it twice. Defense in depth.
+Migration runners track applied migrations in a history table, but this breaks down when a migration partially ran and the runner crashed (not recorded, so it re-runs from the start), or when two nodes race to apply the same migration before advisory locking fires. Write every migration as if the runner might execute it twice.
 
 ---
 
@@ -637,107 +793,46 @@ Write every migration as if the runner might execute it twice. Defense in depth.
 > **🚨 The Most Important Rule in This Document**
 >
 > If you cannot describe the rollback procedure **before** starting a migration, **you are not ready to run the migration.**
->
-> Rollback planning is done before the migration runs — not after something breaks.
 
 ### The Three Levels of Rollback
 
 #### ✅ Level 1: Application Rollback — Always Try This First
-
-Roll the application code back to the previous version. The schema change stays in the database but is simply unused.
-
-Safe during Phase 1 and Phase 2 because the new column is nullable — old code ignores it. No data corruption.
 
 ```bash
 kubectl rollout undo deployment/api-server
 kubectl rollout status deployment/api-server
 ```
 
-**Target time: under 2 minutes.** This should be your default first response for any migration-related incident in the first 24–48 hours after any phase.
-
----
+**Target time: under 2 minutes.** Safe during Phase 1 and Phase 2 because the new column is nullable — old code ignores it.
 
 #### ⚠️ Level 2: Schema Rollback — Use With Caution
-
-Reverse the schema change with a new migration script. Safe only for Phase 1 rollbacks where no data has been written in the new format.
 
 ```sql
 -- Safe for Phase 1 only — column is empty, nothing reads it yet
 ALTER TABLE users DROP COLUMN verified_at;
 ```
 
-> **⚠️ Watch Out:** Before running a schema rollback, confirm exactly which application version is deployed and whether any pod reads the new column. Dropping a column that live code depends on is worse than the original problem.
-
----
+> **⚠️ Watch Out:** Before running a schema rollback, confirm exactly which application version is deployed and whether any pod reads the new column.
 
 #### 🚨 Level 3: Point-In-Time Restore — Last Resort Only
 
-Restore from a snapshot taken before the migration. **You lose every row written since the snapshot.** For a busy system, that can be thousands of transactions.
-
-Use only when Levels 1 and 2 are not viable. If Level 3 is your *primary* rollback plan, the migration was not designed safely.
-
----
-
-### Rollback Plan Template
-
-```
-## Rollback Plan: [Migration Name]
-
-Snapshot taken at:      ___________     Snapshot ID:  ___________
-
-# Level 1 — Application Rollback
-Previous image tag:         ___________
-Rollback command:           kubectl rollout undo deployment/api-server
-Estimated time:             < 2 minutes
-Safe to use until:          ___________  (when does new-format data make this unsafe?)
-
-# Level 2 — Schema Rollback
-Rollback script:            migrations/rollback/V5__rollback.sql
-Rows affected estimate:     ___________
-Lock risk:                  ___________
-Dependencies to roll back:  ___________
-
-# Level 3 — Point-In-Time Restore
-Snapshot ID:                ___________
-Estimated restore time:     ___________
-Data loss window:           ___________
-
-# Trigger thresholds — fill in real numbers, never leave these blank
-Auto-rollback trigger:    Error rate > 2% for 3 consecutive minutes
-Manual rollback trigger:  Replication lag > 30s and not recovering
-Manual rollback trigger:  Migration not complete within 8 hours
-```
+Restore from a snapshot. **You lose every row written since the snapshot.** Use only when Levels 1 and 2 are not viable.
 
 ---
 
 ## 8. Index Migrations
 
-Indexes are among the most dangerous schema operations on a live system. An improperly run index creation on a large table can hold a full table lock for 10–30 minutes — blocking every read and write the entire time.
-
-### The Locking Problem
-
-```sql
--- ❌ DANGEROUS on any large table with live traffic
--- Acquires AccessExclusiveLock — blocks ALL reads and writes until complete
-CREATE INDEX idx_orders_user_id ON orders(user_id);
--- On 100M rows: may block all queries for 10–30 minutes
-```
-
 ### PostgreSQL: Use `CONCURRENTLY`
 
 ```sql
--- ✅ SAFE: builds index in the background
--- Reads and writes continue uninterrupted throughout
+-- ❌ DANGEROUS — acquires AccessExclusiveLock, blocks all reads and writes
+CREATE INDEX idx_orders_user_id ON orders(user_id);
+
+-- ✅ SAFE — builds index in background, reads and writes continue
 CREATE INDEX CONCURRENTLY idx_orders_user_id ON orders(user_id);
 ```
 
-`CONCURRENTLY` builds the index in multiple passes, tracking concurrent changes. It takes 2–3× longer than a normal build but never blocks live traffic.
-
-**Three important constraints:**
-
-- **Cannot run inside a transaction block.** Must be a standalone statement. Running inside `BEGIN ... COMMIT` causes an immediate error.
-- **If it fails mid-build, it leaves an `INVALID` index.** Detect and clean up before retrying.
-- **Only one `CONCURRENTLY` build per table at a time.** A second concurrent build on the same table waits.
+**Three important constraints of `CONCURRENTLY`:** cannot run inside a transaction block; leaves an `INVALID` index if it fails mid-build; only one concurrent build per table at a time.
 
 ```sql
 -- Detect INVALID indexes left by a failed concurrent build
@@ -745,65 +840,37 @@ SELECT i.indexrelid::regclass AS index_name, i.indrelid::regclass AS table_name
 FROM pg_index i
 WHERE i.indisvalid = FALSE;
 
--- Clean up and retry
 DROP INDEX CONCURRENTLY idx_orders_user_id;
 CREATE INDEX CONCURRENTLY idx_orders_user_id ON orders(user_id);
 ```
 
-### Dropping Indexes Safely
-
-```sql
--- ❌ Holds a lock that blocks writes until the drop completes
-DROP INDEX idx_orders_user_id;
-
--- ✅ Non-blocking
-DROP INDEX CONCURRENTLY idx_orders_user_id;
-```
-
-### Estimating Build Time Before Running
-
-```sql
--- Check table size and estimated row count
-SELECT
-    pg_size_pretty(pg_total_relation_size('orders')) AS total_size,
-    pg_size_pretty(pg_relation_size('orders'))       AS table_size,
-    reltuples::BIGINT                                AS estimated_rows
-FROM pg_class
-WHERE relname = 'orders';
-```
-
-**General guideline:** PostgreSQL indexes roughly 10–50 million rows per minute with `CONCURRENTLY`, depending on hardware and write load. Always verify on staging with production-scale data first.
+> **💡 After a heavy backfill, run `REINDEX CONCURRENTLY` to reclaim index bloat caused by dead tuples created during the `UPDATE` batches.**
+> ```sql
+> REINDEX INDEX CONCURRENTLY idx_orders_user_id;
+> ```
 
 ### MySQL: Use `ALGORITHM=INPLACE, LOCK=NONE`
 
-Since MySQL 5.6, InnoDB Online DDL supports adding indexes without locking reads or writes:
-
 ```sql
--- ✅ MySQL: non-locking index creation
 ALTER TABLE orders
 ADD INDEX idx_orders_user_id (user_id)
 ALGORITHM=INPLACE, LOCK=NONE;
 ```
-
-> **⚠️ Watch Out:** MySQL silently falls back to `ALGORITHM=COPY` (full table lock) if conditions are not met (e.g., the index type is not supported for online DDL). Add `ALGORITHM=INPLACE` explicitly so MySQL returns an error instead of silently locking — that forces you to choose deliberately.
 
 ### Composite Index Column Order
 
 The leftmost column must appear in the `WHERE` clause for the index to be used:
 
 ```sql
--- Helps: WHERE user_id = X AND created_at > Y
--- Helps: WHERE user_id = X  (leftmost alone)
--- Does NOT help: WHERE created_at > Y  (skips leftmost column)
 CREATE INDEX CONCURRENTLY idx_orders_user_created ON orders(user_id, created_at);
+-- Helps: WHERE user_id = X AND created_at > Y
+-- Helps: WHERE user_id = X
+-- Does NOT help: WHERE created_at > Y
 ```
 
 ### Partial Indexes (PostgreSQL)
 
-Index only the subset of rows queried most often — smaller, faster, less disk:
-
 ```sql
--- Only index ~5M active orders out of 100M total
 CREATE INDEX CONCURRENTLY idx_orders_active_user
 ON orders(user_id)
 WHERE status = 'active';
@@ -813,327 +880,137 @@ WHERE status = 'active';
 
 ## 9. Long Transactions
 
-### What Is a Long Transaction and Why Is It Dangerous?
+### Why Long Transactions Are Dangerous
 
-A long transaction is any database transaction that remains open — uncommitted or not yet rolled back — for an extended period. In PostgreSQL and MySQL alike, long transactions cause cascading problems that worsen over time.
+A long transaction holds all locks for its full duration, prevents VACUUM from reclaiming dead rows (causing bloat), forces WAL retention that can fill disk, and blocks logical replication slot advancement.
 
-**Harm 1 — Locks are held for the full duration.**
-Any row-level or table-level lock acquired inside the transaction is held until it commits or rolls back. A migration that wraps DDL and a large data update in one transaction holds the DDL lock for the entire duration of the data operation.
-
-**Harm 2 — VACUUM cannot reclaim dead rows (PostgreSQL).**
-Every `UPDATE` creates a new row version; the old version becomes a dead row. VACUUM reclaims dead rows — but only if no open transaction could still see them. A transaction open for hours prevents VACUUM from cleaning up, causing table bloat that slows every subsequent query.
-
-**Harm 3 — WAL cannot be truncated (PostgreSQL).**
-PostgreSQL must retain all Write-Ahead Log entries from before the oldest open transaction. A long-running transaction forces WAL retention, which can fill disk on the primary.
-
-**Harm 4 — Replication slot lag.**
-If you use logical replication (e.g., Debezium for CDC), the replication slot cannot advance past a long-running transaction on the primary, causing replica lag and potential disk fill.
-
-> **📘 Real Example: DDL + backfill in one transaction — 45-minute freeze**
+> **📘 DDL + backfill in one transaction — 45-minute freeze**
 >
 > ```sql
+> -- ❌ DDL lock held for the entire 45-minute UPDATE
 > BEGIN;
 > ALTER TABLE orders ADD COLUMN shipped_at TIMESTAMP NULL;
-> -- ALTER TABLE acquired AccessExclusiveLock
->
-> -- 10M-row backfill runs inside the same transaction
 > UPDATE orders SET shipped_at = created_at WHERE status = 'shipped';
-> -- Ran for 45 minutes — holding the DDL lock the entire time
 > COMMIT;
-> ```
 >
-> Every query to the `orders` table was blocked for 45 minutes.
->
-> **Fix:** Separate DDL from long data operations:
-> ```sql
-> -- Transaction 1: fast DDL — lock held for milliseconds
+> -- ✅ Separate DDL from data operations
 > ALTER TABLE orders ADD COLUMN shipped_at TIMESTAMP NULL;
->
-> -- Outside any transaction: batched backfill (see Section 5)
-> -- No DDL lock held during data work
-> UPDATE orders SET shipped_at = created_at
-> WHERE status = 'shipped' AND id > %(last_id)s
-> LIMIT 1000;
+> -- Then backfill in batches (see Section 5)
 > ```
 
 ### Detecting Long Transactions
 
 ```sql
 -- PostgreSQL: transactions open for more than 5 minutes
-SELECT
-    pid,
-    now() - xact_start          AS transaction_age,
-    now() - query_start         AS current_query_age,
-    state,
-    wait_event_type,
-    wait_event,
-    LEFT(query, 120)            AS query_preview
+SELECT pid, now() - xact_start AS transaction_age, state, LEFT(query, 120) AS query_preview
 FROM pg_stat_activity
-WHERE xact_start IS NOT NULL
-  AND (now() - xact_start) > INTERVAL '5 minutes'
+WHERE xact_start IS NOT NULL AND (now() - xact_start) > INTERVAL '5 minutes'
 ORDER BY transaction_age DESC;
 ```
 
-```sql
--- MySQL: transactions open for more than 5 minutes
-SELECT
-    trx_id,
-    trx_started,
-    TIMESTAMPDIFF(SECOND, trx_started, NOW()) AS seconds_open,
-    trx_query
-FROM information_schema.innodb_trx
-WHERE TIMESTAMPDIFF(SECOND, trx_started, NOW()) > 300
-ORDER BY trx_started ASC;
-```
-
-### Terminating a Long Transaction
+### Setting Timeouts
 
 ```sql
--- PostgreSQL: graceful cancel (rolls back transaction)
-SELECT pg_cancel_backend(pid);
-
--- PostgreSQL: force terminate the connection
-SELECT pg_terminate_backend(pid);
-
--- MySQL: cancel the current query (keeps connection)
-KILL QUERY <thread_id>;
-
--- MySQL: terminate the connection entirely
-KILL <thread_id>;
-```
-
-### Setting Timeouts as a Safety Net
-
-```sql
--- PostgreSQL: set timeouts on the migration connection
--- Prevents any single statement from running unbounded
 SET statement_timeout = '30s';
-
--- Terminates a connection that has been idle inside a transaction for 10+ minutes
 SET idle_in_transaction_session_timeout = '10min';
-```
-
-```python
-# psycopg2 (Python): set timeouts at connection level
-# statement_timeout: milliseconds | idle_in_transaction_session_timeout: milliseconds
-conn = psycopg2.connect(
-    dsn=DATABASE_URL,
-    options=(
-        "-c statement_timeout=30000 "            # 30 seconds
-        "-c idle_in_transaction_session_timeout=600000"  # 10 minutes
-    )
-)
-```
-
-```sql
--- MySQL equivalent: set lock wait timeout for this session
-SET SESSION innodb_lock_wait_timeout = 10;  -- seconds before lock acquisition fails
 ```
 
 ---
 
 ## 10. Foreign Key Validation
 
-### The Hidden Cost
+### The Hidden Cost — Including Parent Table Impact
 
-Adding a foreign key to an existing table is one of the most dangerous operations you can run without preparation. When you add a foreign key normally, the database must **validate every existing row** — confirming each foreign key value references a real row in the parent table.
+Adding a foreign key normally causes the database to validate every existing row, scanning the child table with an `AccessExclusiveLock` on both tables for the entire scan duration.
 
-On a table with 80 million rows, this validation scan can run for tens of minutes, holding a lock on **both** tables the entire time.
-
-> **📘 Real Example: A 40-minute outage from one FK**
+> **⚠️ Additional Risk: Parent Table Contention**
 >
-> ```sql
-> -- This looks like a two-second operation. It is not.
-> ALTER TABLE comments
-> ADD CONSTRAINT fk_comment_user
-> FOREIGN KEY (user_id) REFERENCES users(id);
-> ```
->
-> `comments` has 80M rows. Validation scanned every row for 40 minutes. Inserts and updates to `comments` were blocked for the entire duration. Comment posting was unavailable for 40 minutes.
+> Foreign key validation does not only lock the child table — it requires a **shared lock on the parent table** for every row check during `VALIDATE CONSTRAINT`. If the parent is a high-traffic table like `users` or `orders`, the validation scan can cause sluggishness or lock contention on the parent, even when using `NOT VALID` + `VALIDATE CONSTRAINT`. Schedule `VALIDATE CONSTRAINT` during the lowest-traffic window possible for tables with high-volume parents.
 
 ### PostgreSQL: `NOT VALID` + `VALIDATE CONSTRAINT`
 
-Split into two steps — separate the cheap constraint declaration from the expensive validation scan:
-
 ```sql
--- Step 1: Declare constraint WITHOUT scanning existing rows
--- Fast — brief lock to register the constraint in the catalog
--- All NEW rows are enforced immediately; existing rows deferred
+-- Step 1: Declare constraint without scanning existing rows (fast)
 ALTER TABLE comments
 ADD CONSTRAINT fk_comment_user
 FOREIGN KEY (user_id) REFERENCES users(id)
 NOT VALID;
 
--- Step 2: Validate existing rows — at a low-traffic time
--- Uses ShareUpdateExclusiveLock — much weaker; allows concurrent reads and DML
+-- Step 2: Validate existing rows — run during low-traffic window
+-- Uses ShareUpdateExclusiveLock — allows concurrent reads and DML
 ALTER TABLE comments VALIDATE CONSTRAINT fk_comment_user;
 ```
 
 | Approach | Lock Acquired | Blocks |
 |---|---|---|
 | `ADD CONSTRAINT FK` (normal) | `AccessExclusiveLock` on both tables | ALL reads and writes for full scan duration |
-| `ADD CONSTRAINT ... NOT VALID` | `ShareRowExclusiveLock` | DDL only — reads and DML continue |
-| `VALIDATE CONSTRAINT` | `ShareUpdateExclusiveLock` | Concurrent DDL only |
+| `ADD CONSTRAINT ... NOT VALID` | `ShareRowExclusiveLock` | DDL only |
+| `VALIDATE CONSTRAINT` | `ShareUpdateExclusiveLock` | Concurrent DDL only — but still holds shared lock on parent |
 
-**Same pattern works for `CHECK` constraints:**
-```sql
-ALTER TABLE orders ADD CONSTRAINT chk_positive_amount CHECK (amount > 0) NOT VALID;
-ALTER TABLE orders VALIDATE CONSTRAINT chk_positive_amount;
-```
-
-### MySQL: Use `ALGORITHM=INPLACE, LOCK=NONE` Where Supported
-
-MySQL does not have a direct `NOT VALID` equivalent. For InnoDB when the referenced column already has a compatible index, use Online DDL:
+### MySQL
 
 ```sql
--- MySQL: add FK with minimal locking when supported
 ALTER TABLE comments
 ADD CONSTRAINT fk_comment_user FOREIGN KEY (user_id) REFERENCES users(id),
 ALGORITHM=INPLACE, LOCK=NONE;
 ```
 
-If Online DDL is not supported for the specific operation, MySQL will return an error and you should plan a maintenance window or use an online schema change tool (**gh-ost** or **pt-online-schema-change**) instead.
-
 ---
 
 ## 11. Replication Impact
 
-### Why It Matters
-
-Most production databases use replication — a primary handles writes, replicas serve reads and act as failover targets. Migrations that generate heavy writes create **replication lag**: replicas fall behind the primary and start serving stale data.
-
-The danger is subtle: **replication lag is invisible at the application layer**. Queries succeed. No errors are thrown. Read-replicas silently return outdated rows — potentially minutes behind the primary.
-
-> **📘 Real Example: Backfill created 8-minute replica lag**
->
-> A team ran a batched backfill (1,000 rows per batch, no sleep between batches) on a 60M-row table. The primary handled writes fine. Replicas started falling behind within minutes. After 20 minutes, replica lag reached 8 minutes. The application load-balanced reads across primary and replicas — 70% of users were seeing data 8 minutes old. Missing orders, incorrect balances, absent notification counts. No errors anywhere in the logs.
-
-### How Lag Builds Up
-
-```
-Primary: [batch 1][batch 2][batch 3][batch 4]...  → 5,000 rows/sec written
-Replica: [batch 1][batch 2]                        → 3,000 rows/sec replayed
-                            ↑
-                            Lag growing — 2,000 rows/sec falling behind
-```
+Most production databases replicate writes to one or more replicas. Migrations that generate heavy writes create **replication lag** — replicas fall behind and serve stale data invisibly (no errors, wrong answers).
 
 ### Measuring Replication Lag
 
 ```sql
--- PostgreSQL: on the primary — check lag for all connected replicas
-SELECT
-    client_addr,
-    application_name,
-    write_lag,
-    flush_lag,
-    replay_lag,
-    pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn)) AS bytes_behind
-FROM pg_stat_replication
-ORDER BY replay_lag DESC NULLS LAST;
+-- PostgreSQL primary: check lag for all connected replicas
+SELECT client_addr, write_lag, flush_lag, replay_lag,
+       pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn)) AS bytes_behind
+FROM pg_stat_replication ORDER BY replay_lag DESC NULLS LAST;
 
--- PostgreSQL: on a replica — check its own current lag
+-- PostgreSQL replica: check own current lag
 SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;
-```
-
-```sql
--- MySQL: on a replica (MySQL 8.0.22+)
-SHOW REPLICA STATUS\G
--- Look at: Seconds_Behind_Source
--- On older MySQL (<8.0.22): column was named Seconds_Behind_Master
 ```
 
 ### Replication-Aware Backfill
 
 ```python
-import time
-
 def run_backfill_with_lag_check(db, max_lag_seconds: int = 5):
     BATCH_SIZE = 1_000
     last_id    = 0
-
     while True:
-        # Check replica lag before each batch — pause if replicas are falling behind
         row = db.execute("""
             SELECT EXTRACT(EPOCH FROM MAX(replay_lag)) AS lag_sec
             FROM pg_stat_replication
         """).fetchone()
-
         lag = float(row["lag_sec"] or 0)
         if lag > max_lag_seconds:
             print(f"Replica lag {lag:.1f}s — pausing 10s...")
             time.sleep(10)
             continue
-
         rows = db.execute("""
-            SELECT id FROM users
-            WHERE verified_at IS NULL AND id > %(last_id)s
+            SELECT id FROM users WHERE verified_at IS NULL AND id > %(last_id)s
             ORDER BY id ASC LIMIT %(batch_size)s
         """, {"last_id": last_id, "batch_size": BATCH_SIZE}).fetchall()
-
         if not rows:
             break
-
         ids = [r["id"] for r in rows]
         db.execute("""
             UPDATE users SET verified_at = created_at
             WHERE id = ANY(%(ids)s) AND verified_at IS NULL
         """, {"ids": ids})
-
         last_id = ids[-1]
         time.sleep(0.05)
 ```
-
-### Replication Slots and Disk Risk (PostgreSQL)
-
-If you use **logical replication slots** (common with CDC tools like Debezium), long migrations create a disk risk: the slot cannot advance while the migration generates WAL faster than consumers can process it, forcing the primary to retain all that WAL.
-
-```sql
--- Check how much WAL each logical slot is retaining
-SELECT
-    slot_name,
-    active,
-    pg_size_pretty(
-        pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)
-    ) AS retained_wal
-FROM pg_replication_slots
-ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) DESC;
-```
-
-If retained WAL grows rapidly during a migration, pause the migration until the slot catches up — or temporarily drop the slot if the consumer can safely replay from a checkpoint.
 
 ---
 
 ## 12. Disk Space During Migrations
 
-Disk full is one of the few database failures that can be unrecoverable without manual intervention. PostgreSQL with a full disk stops accepting writes entirely. Understanding how migrations consume disk lets you plan ahead.
-
 ### Four Sources of Unexpected Disk Usage
 
-**1. Table rewrites.** Some `ALTER TABLE` operations create a full copy of the table on disk before dropping the original. A 200GB table temporarily requires 400GB.
-
-**2. Concurrent index builds.** `CREATE INDEX CONCURRENTLY` creates the new index before anything is dropped. During the build, both the full table data and the growing new index occupy disk simultaneously.
-
-**3. MVCC dead-row bloat (PostgreSQL).** Every `UPDATE` creates a new row version; the old version becomes a dead row. During a heavy backfill, writes arrive faster than autovacuum can clean up. A 100M-row table being heavily updated may temporarily grow 30–50%.
-
-**4. WAL retention.** Every write generates WAL entries. A 100M-row backfill can produce gigabytes of WAL, all retained until replicas have replayed it.
-
-### Estimating Disk Requirements
-
-```sql
--- PostgreSQL: current table and index sizes
-SELECT
-    pg_size_pretty(pg_total_relation_size('orders')) AS total_size,
-    pg_size_pretty(pg_relation_size('orders'))       AS table_size,
-    pg_size_pretty(pg_indexes_size('orders'))        AS index_size;
-
--- Total database size
-SELECT pg_size_pretty(pg_database_size(current_database())) AS db_size;
-```
-
-**Rules of thumb:**
-- Table rewrite operations: ensure **2× table size** free disk
-- Adding a new index: ensure **1× estimated index size** free disk
-- Heavy backfill: budget **1.5× table size** for temporary MVCC bloat
+**Table rewrites** create a full copy before dropping the original (2× table size). **Concurrent index builds** hold both the old and new index on disk simultaneously. **MVCC dead-row bloat** (PostgreSQL) accumulates during heavy backfills as autovacuum struggles to keep up. **WAL retention** from heavy writes can grow to gigabytes until replicas catch up.
 
 ### Which PostgreSQL Operations Cause a Full Table Rewrite
 
@@ -1142,122 +1019,60 @@ SELECT pg_size_pretty(pg_database_size(current_database())) AS db_size;
 | `ADD COLUMN ... NULL` | **No** | The safe expand/contract approach |
 | `ADD COLUMN ... NOT NULL DEFAULT <constant>` | **No** (PG 11+) | Constant default stored in catalog |
 | `ADD COLUMN ... NOT NULL DEFAULT <function>` | **Yes** | Function-computed defaults still rewrite |
-| `ALTER COLUMN TYPE` | **Yes** | Always rewrites unless the cast is trivial |
-| `SET TABLESPACE` | **Yes** | Physically moves the file |
+| `ALTER COLUMN TYPE` | **Yes** | Always rewrites unless cast is trivial |
 | `VACUUM FULL` | **Yes** | Creates a new compact copy |
-| `CREATE INDEX CONCURRENTLY` | **No** | Builds new index; does not rewrite table data |
+| `CREATE INDEX CONCURRENTLY` | **No** | Builds new index without rewriting table |
 
-### Monitoring Disk and Bloat During a Migration
+### Monitoring Disk and Bloat
 
 ```sql
--- Monitor live bloat and vacuum status during a backfill
-SELECT
-    tablename,
-    pg_size_pretty(pg_total_relation_size(tablename::regclass)) AS current_size,
-    n_dead_tup    AS dead_rows,
-    n_live_tup    AS live_rows,
-    last_autovacuum,
-    last_autoanalyze
+SELECT tablename,
+       pg_size_pretty(pg_total_relation_size(tablename::regclass)) AS current_size,
+       n_dead_tup AS dead_rows, n_live_tup AS live_rows,
+       last_autovacuum, last_autoanalyze
 FROM pg_stat_user_tables
 WHERE tablename = 'orders';
-```
-
-### Triggering Manual VACUUM During a Migration
-
-Autovacuum often cannot keep up with a heavy backfill. Run VACUUM manually in a separate session:
-
-```sql
--- Non-locking — runs concurrently with reads and writes
-VACUUM ANALYZE orders;
-
--- VACUUM FULL: only if immediate space reclamation is needed
--- AND you can afford an exclusive lock (maintenance window only)
--- VACUUM FULL orders;
 ```
 
 ---
 
 ## 13. Lock Diagnostics
 
-### Why This Section Matters
+### Set `lock_timeout` Before Every DDL Statement
 
-During any migration, something unexpected may hold a conflicting lock — an analytics query, a long-running transaction, a forgotten `SELECT FOR UPDATE`. Without visibility into what is blocking what, you are flying blind.
-
-The most dangerous scenario is **lock queue cascade**: once your migration is waiting for a lock, every subsequent query needing that table queues behind it. A migration waiting behind a 4-minute analytics query can cause a full application hang within 30 seconds.
-
-> **📘 Real Example: A lock queue that took down the application**
+> **🚨 This is non-negotiable. Add it to every migration script.**
 >
-> A team ran `ALTER TABLE users ADD COLUMN ...` which needed `AccessExclusiveLock`. An analytics query had been running for 3 minutes and held a `ShareLock`. The `ALTER TABLE` queued behind it. Every new query needing any lock on `users` then queued behind the `ALTER TABLE`. Within 30 seconds, the connection pool was full. The application stopped responding for 4 minutes — caused not by the migration itself but by the lock queue in front of it.
+> An `ALTER TABLE` waiting for a lock silently queues all subsequent queries behind it. Within 30 seconds, your connection pool can be full.
+>
+> ```sql
+> -- ✅ Required at the top of every migration script
+> SET lock_timeout = '5s';
+> ALTER TABLE users ADD COLUMN verified_at TIMESTAMP NULL;
+> -- On timeout: ERROR: canceling statement due to lock timeout
+> -- → find the blocking query, wait for it to finish, then retry
+> ```
 
-### The `lock_timeout` Safety Net — Set This Before Every Migration
-
-```sql
--- PostgreSQL: if the migration cannot acquire its lock within 5 seconds, fail.
--- Better to fail fast and retry than to queue and cascade.
-SET lock_timeout = '5s';
-ALTER TABLE users ADD COLUMN verified_at TIMESTAMP NULL;
--- On timeout: ERROR: canceling statement due to lock timeout
--- → find the blocking query, wait for it to finish, then retry
-```
+If you cannot acquire the lock in 5 seconds, **fail fast and retry** rather than queuing and cascading.
 
 ### Finding the Blocking Chain (PostgreSQL)
 
 ```sql
--- Full lock blocking chain — who is waiting and who is blocking
 SELECT
-    blocked.pid                  AS blocked_pid,
-    LEFT(blocked.query, 80)      AS blocked_query,
-    blocked_locks.locktype,
-    blocking.pid                 AS blocking_pid,
-    LEFT(blocking.query, 80)     AS blocking_query,
-    now() - blocked.query_start  AS blocked_for
-FROM pg_catalog.pg_locks         blocked_locks
-JOIN pg_catalog.pg_stat_activity blocked
-    ON  blocked.pid = blocked_locks.pid
-JOIN pg_catalog.pg_locks         blocking_locks
-    ON  blocking_locks.locktype = blocked_locks.locktype
+    blocked.pid AS blocked_pid, LEFT(blocked.query, 80) AS blocked_query,
+    blocking.pid AS blocking_pid, LEFT(blocking.query, 80) AS blocking_query,
+    now() - blocked.query_start AS blocked_for
+FROM pg_catalog.pg_locks blocked_locks
+JOIN pg_catalog.pg_stat_activity blocked ON blocked.pid = blocked_locks.pid
+JOIN pg_catalog.pg_locks blocking_locks
+    ON blocking_locks.locktype = blocked_locks.locktype
     AND blocking_locks.relation = blocked_locks.relation
-    AND blocking_locks.pid     != blocked_locks.pid
-JOIN pg_catalog.pg_stat_activity blocking
-    ON  blocking.pid = blocking_locks.pid
+    AND blocking_locks.pid != blocked_locks.pid
+JOIN pg_catalog.pg_stat_activity blocking ON blocking.pid = blocking_locks.pid
 WHERE NOT blocked_locks.granted
 ORDER BY blocked_for DESC;
 ```
 
-### All Locks on a Specific Table (PostgreSQL)
-
-```sql
-SELECT
-    pid,
-    mode,
-    granted,
-    LEFT(query, 80)      AS query,
-    now() - query_start  AS held_for
-FROM pg_locks l
-JOIN pg_stat_activity a USING (pid)
-WHERE relation = 'users'::regclass
-ORDER BY granted DESC, held_for DESC NULLS LAST;
-```
-
-### MySQL: Finding Blocking Queries
-
-```sql
--- MySQL: see all current InnoDB lock waits
-SELECT
-    r.trx_id                         AS waiting_trx_id,
-    r.trx_mysql_thread_id            AS waiting_thread,
-    LEFT(r.trx_query, 80)            AS waiting_query,
-    b.trx_id                         AS blocking_trx_id,
-    b.trx_mysql_thread_id            AS blocking_thread,
-    LEFT(b.trx_query, 80)            AS blocking_query
-FROM information_schema.innodb_lock_waits w
-JOIN information_schema.innodb_trx b ON b.trx_id = w.blocking_trx_id
-JOIN information_schema.innodb_trx r ON r.trx_id = w.requesting_trx_id;
-```
-
-### Lock Mode Compatibility (PostgreSQL)
-
-Not all locks conflict. Knowing the hierarchy lets you reason about whether a migration blocks live traffic:
+### Lock Mode Compatibility
 
 | Operation | Lock Acquired | What It Blocks |
 |---|---|---|
@@ -1267,37 +1082,516 @@ Not all locks conflict. Knowing the hierarchy lets you reason about whether a mi
 | `VALIDATE CONSTRAINT` | `ShareUpdateExclusiveLock` | Concurrent DDL only |
 | `ALTER TABLE` (most forms) | `AccessExclusiveLock` | **Everything** — all reads and writes |
 
-### Pre-Migration Lock Check
+---
 
-```python
-def is_safe_to_migrate(db, table_name: str, max_wait_sec: int = 10) -> bool:
-    """Return True if no long-running queries hold significant locks on the table."""
-    with db.cursor() as cur:
-        cur.execute("""
-            SELECT pid, now() - query_start AS held_for, LEFT(query, 80) AS query
-            FROM pg_locks l
-            JOIN pg_stat_activity a USING (pid)
-            WHERE relation = %s::regclass
-              AND mode NOT IN ('AccessShareLock')
-              AND granted = TRUE
-        """, (table_name,))
-        holders = cur.fetchall()
+## 14. VACUUM, Bloat, and Transaction ID Wraparound
 
-    long_holders = [h for h in holders if h["held_for"].total_seconds() > max_wait_sec]
-    for h in long_holders:
-        print(f"  ⚠️  PID {h['pid']} held lock for {h['held_for']}: {h['query']}")
-    return len(long_holders) == 0
+> **🆕 This section is essential reading before any large backfill.**
+
+### Dead Tuples: The Hidden Cost of Every UPDATE
+
+Every `UPDATE` in PostgreSQL creates a **dead tuple** — the old row version is retained in the table until VACUUM reclaims it. This is by design (MVCC multi-version concurrency), but it has serious consequences at migration scale.
+
+When you run a batched backfill across 50 million rows, you are creating up to **50 million dead tuples**. If autovacuum cannot keep up, those dead tuples remain in the table and its indexes permanently (until the next VACUUM), causing:
+
+- **Table bloat** — the physical table file grows far beyond its logical data size, causing slower sequential scans
+- **Index bloat** — index pages fill with dead-row pointers, increasing the size and depth of every index, slowing every indexed query
+- **Autovacuum thrashing** — a runaway autovacuum process competing with live queries for I/O
+
+> **📘 Real-World Scale**
+>
+> A 100M-row table with an average row size of 200 bytes occupies roughly 20GB. A full-table backfill (every row updated once) temporarily creates another 20GB of dead tuples — effectively doubling table size on disk. Index bloat adds further overhead. For tables with 5–10 indexes, total temporary bloat can reach 3–4× table size.
+
+### Monitoring Dead Tuples During a Backfill
+
+```sql
+-- Run this in a separate session while the backfill is in progress
+SELECT
+    n_live_tup                AS live_rows,
+    n_dead_tup                AS dead_rows,
+    ROUND(
+        n_dead_tup::DECIMAL / NULLIF(n_live_tup + n_dead_tup, 0) * 100, 1
+    )                         AS dead_pct,
+    last_autovacuum,
+    last_autoanalyze,
+    pg_size_pretty(pg_total_relation_size('users')) AS total_size
+FROM pg_stat_user_tables
+WHERE relname = 'users';
+```
+
+**Alert threshold:** If `dead_pct` climbs above 20% and autovacuum is not running, **pause the backfill** and run a manual VACUUM.
+
+### Tuning Autovacuum for the Migrated Table
+
+By default, autovacuum triggers when dead tuples exceed 20% of the table (`autovacuum_vacuum_scale_factor = 0.2`). On a 100M-row table, that is 20 million dead tuples before autovacuum fires. During a heavy backfill, this threshold may never be crossed until after the damage is done.
+
+**Reduce the threshold for the specific table during your migration:**
+
+```sql
+-- Lower the vacuum trigger for this table: fire when 5% of rows are dead
+-- (instead of the default 20%)
+ALTER TABLE users SET (
+    autovacuum_vacuum_scale_factor = 0.05,
+    autovacuum_analyze_scale_factor = 0.02,
+    autovacuum_vacuum_cost_delay = 2     -- ms between vacuum I/O operations; lower = faster
+);
+
+-- After migration completes, restore defaults
+ALTER TABLE users RESET (
+    autovacuum_vacuum_scale_factor,
+    autovacuum_analyze_scale_factor,
+    autovacuum_vacuum_cost_delay
+);
+```
+
+### Running Manual VACUUM During a Backfill
+
+Do not wait for autovacuum to catch up on a large backfill — run VACUUM manually in a separate session:
+
+```sql
+-- Non-locking: runs concurrently with reads and writes
+VACUUM ANALYZE users;
+```
+
+> **⚠️ Do NOT use `VACUUM FULL` on a live table.** `VACUUM FULL` creates a fully rewritten copy of the table and holds an `AccessExclusiveLock` for the entire duration — effectively the same as the dangerous `ALTER TABLE` you were trying to avoid. Reserve `VACUUM FULL` for maintenance windows only.
+
+### Checking Index Bloat After a Backfill
+
+After a heavy backfill completes, inspect index bloat and consider reindexing:
+
+```sql
+-- Estimate index bloat using pg_stat_user_indexes
+SELECT
+    indexrelname AS index_name,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+    idx_scan,
+    idx_tup_read,
+    idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE relname = 'users'
+ORDER BY pg_relation_size(indexrelid) DESC;
+
+-- Non-blocking reindex after backfill (PostgreSQL 12+)
+REINDEX INDEX CONCURRENTLY idx_users_email;
 ```
 
 ---
 
-## 14. Versioned Migration System
+### Transaction ID (TXID) Wraparound — The Database Shutdown Risk
 
-### What Is It and Why Does It Matter?
+This is the failure mode that most engineers never encounter — but when they do, it causes a complete database shutdown.
 
-A versioned migration system treats every schema change as a **versioned, immutable artifact** — like source code commits. Every change gets a unique version number, lives in version control, and is tracked in the database so you always know exactly what state the schema is in.
+**How PostgreSQL assigns transaction IDs:** Every transaction gets a 32-bit integer transaction ID (TXID). PostgreSQL has a maximum of **2,147,483,648** (2³¹, or about 2.1 billion) active transaction IDs in circulation at any time. The IDs wrap around in a circle — the system uses modular arithmetic to determine whether one transaction is "older" or "newer" than another.
 
-Without this, teams accumulate "mystery migrations" — changes applied directly to production by hand, never recorded, impossible to reproduce, invisible in the audit trail.
+**The risk:** If VACUUM does not keep up and old transaction IDs are never freed, the live transaction counter approaches the wraparound boundary. When the gap between the oldest unvacuumed transaction and the current transaction counter falls to about 40 million, PostgreSQL issues warnings. At 3 million remaining, **PostgreSQL shuts down and refuses to process any new transactions** until the issue is manually resolved in single-user mode.
+
+> **📘 Why Migrations Accelerate Wraparound**
+>
+> Aggressive backfills consume transaction IDs quickly — thousands per second. Long-running transactions (Section 9) prevent VACUUM from advancing the oldest-transaction horizon. A combination of both can advance toward wraparound faster than routine autovacuum can compensate.
+
+### Monitoring TXID Horizon
+
+```sql
+-- Check how far away wraparound is for each database
+-- age() returns the number of transactions since the oldest unfrozen XID
+SELECT
+    datname,
+    age(datfrozenxid)                     AS txid_age,
+    2147483648 - age(datfrozenxid)        AS txids_remaining,
+    ROUND(age(datfrozenxid)::DECIMAL / 2147483648 * 100, 2) AS pct_consumed
+FROM pg_database
+ORDER BY age(datfrozenxid) DESC;
+```
+
+```sql
+-- Check the most at-risk tables (tables with the oldest unfrozen XID)
+SELECT
+    relname AS table_name,
+    age(relfrozenxid) AS table_txid_age
+FROM pg_class
+WHERE relkind = 'r'
+ORDER BY age(relfrozenxid) DESC
+LIMIT 20;
+```
+
+**Alert thresholds:**
+
+| `txid_age` | Status | Action |
+|---|---|---|
+| < 500M | ✅ Safe | No action needed |
+| 500M – 1B | ⚠️ Elevated | Verify autovacuum is running; check for long transactions |
+| 1B – 1.5B | 🔴 High Risk | Manually run `VACUUM FREEZE` on the most-aged tables |
+| > 1.5B | 🚨 Critical | Immediate intervention required — database shutdown is imminent |
+
+### Forcing TXID Freeze on At-Risk Tables
+
+```sql
+-- VACUUM FREEZE marks rows as "frozen" — their XID no longer ages
+-- This is a non-locking operation (unlike VACUUM FULL)
+VACUUM FREEZE ANALYZE users;
+
+-- Check that the freeze was effective
+SELECT relname, age(relfrozenxid) AS age_after_freeze
+FROM pg_class WHERE relname = 'users';
+```
+
+
+### Tuning `autovacuum_work_mem` for Heavy Backfills
+
+By default, autovacuum inherits `maintenance_work_mem` for its working memory (`autovacuum_work_mem = -1`). On systems where `maintenance_work_mem` is conservatively set, autovacuum processes large dead-tuple arrays too slowly to keep pace with a 50M-row backfill.
+
+> **VP-level concern:** "I don't care if the backfill takes 4 days. I care if it triggers a forced database shutdown on day 3."
+
+Increase it for the duration of the migration window, then restore it:
+
+```sql
+-- Temporarily increase autovacuum working memory (default = -1, often 64-256MB)
+-- 1GB gives autovacuum enough headroom to process large dead-tuple arrays quickly
+ALTER SYSTEM SET autovacuum_work_mem = '1GB';
+SELECT pg_reload_conf();    -- takes effect on the next autovacuum worker start
+
+-- After migration complete: restore the default
+ALTER SYSTEM SET autovacuum_work_mem = -1;
+SELECT pg_reload_conf();
+```
+
+For a manual VACUUM run, set the session-level equivalent:
+
+```sql
+SET maintenance_work_mem = '1GB';
+VACUUM ANALYZE users;
+-- Resets automatically when the session ends
+```
+
+**Monitoring whether autovacuum is keeping pace:**
+
+```sql
+-- Is autovacuum currently running on the target table?
+SELECT pid, query, now() - query_start AS running_for
+FROM pg_stat_activity
+WHERE query LIKE '%autovacuum%' AND query LIKE '%users%';
+
+-- Sample dead-tuple growth rate: run twice, ~60s apart
+SELECT n_dead_tup, now() AS sampled_at FROM pg_stat_user_tables WHERE relname = 'users';
+```
+
+If dead tuples are growing faster than they are being reclaimed: reduce the backfill batch rate, increase `autovacuum_work_mem` further, or run manual `VACUUM ANALYZE` in a separate session after every 10 batches.
+
+### What To Do During an Aggressive Backfill
+
+1. **Before starting:** Check `txid_age` baseline — if already above 1B, delay the backfill until VACUUM FREEZE has been run.
+2. **During the backfill:** Monitor `txid_age` every hour. If it rises faster than expected, reduce batch frequency or pause.
+3. **After the backfill:** Run `VACUUM ANALYZE` on the target table. Re-check `txid_age` and `n_dead_tup` before declaring the migration complete.
+4. **Long-term:** Ensure autovacuum is not disabled or starved of resources on any table involved in migration-heavy workloads.
+
+---
+
+---
+
+## 15. JSONB to Structured Column Migrations
+
+### Why This Is Different
+
+Splitting a plain text column is mechanical. Extracting fields from a JSONB blob is a **schema archaeology problem**: the field may be absent from some rows, spelled differently across document versions, or nested at varying depths. Getting the backfill wrong is silent — no constraint violation, no type error, just incorrect data in the new column.
+
+This is now one of the most common migration patterns in production — most modern applications accumulate JSONB blobs before eventually needing queryable, indexed structured columns.
+
+### Phase 1: Understand the JSONB Shape Before Writing Any SQL
+
+Never assume uniform structure. Sample the actual distribution first:
+
+```sql
+-- What keys exist, and how often?
+SELECT
+    key,
+    COUNT(*) AS occurrences,
+    ROUND(COUNT(*)::DECIMAL / (SELECT COUNT(*) FROM events) * 100, 1) AS pct_rows
+FROM events, jsonb_object_keys(payload) AS key
+GROUP BY key
+ORDER BY occurrences DESC;
+
+-- What types does a specific field actually contain?
+SELECT jsonb_typeof(payload->'amount') AS value_type, COUNT(*)
+FROM events WHERE payload ? 'amount'
+GROUP BY 1;
+
+-- Sample rows where the field is missing
+SELECT id, payload FROM events WHERE payload->>'amount' IS NULL LIMIT 20;
+```
+
+This reveals which rows will be `NULL` in the new column (field absent), which need type coercion, and whether naming inconsistencies exist.
+
+### Phase 2: Add the New Structured Columns (Expand)
+
+```sql
+-- Always nullable at first — rows without the field will stay NULL
+ALTER TABLE events ADD COLUMN amount_cents INTEGER NULL;
+ALTER TABLE events ADD COLUMN currency     VARCHAR(3) NULL;
+```
+
+### Phase 3: Backfill Using a Batched FROM-Subquery — Not a Correlated Subquery
+
+> **The CPU Trap: Correlated Subquery vs Batched FROM-Subquery**
+>
+> The intuitive approach is a correlated subquery. It will destroy performance on large tables:
+>
+> ```sql
+> -- DANGEROUS: correlated subquery re-evaluates for every row independently
+> UPDATE events
+> SET amount_cents = (
+>     SELECT (e2.payload->>'amount')::INTEGER
+>     FROM events e2 WHERE e2.id = events.id
+> );
+> -- On 20M rows: re-executes 20M times. CPU spikes to 100%.
+> -- API latency doubles within minutes.
+> ```
+>
+> Use a batched `FROM`-subquery instead — PostgreSQL evaluates it once per batch, not once per row:
+
+```python
+import time
+
+def backfill_jsonb_to_columns(db):
+    BATCH_SIZE = 1_000
+    last_id    = 0
+
+    while True:
+        result = db.execute("""
+            UPDATE events e
+            SET
+                amount_cents = (src.amount_raw::NUMERIC * 100)::INTEGER,
+                currency     = src.currency_raw
+            FROM (
+                SELECT id,
+                       payload->>'amount'   AS amount_raw,
+                       payload->>'currency' AS currency_raw
+                FROM events
+                WHERE id > %(last_id)s
+                  AND amount_cents IS NULL
+                ORDER BY id
+                LIMIT %(batch_size)s
+            ) AS src
+            WHERE e.id = src.id
+        """, {"last_id": last_id, "batch_size": BATCH_SIZE})
+
+        if result.rowcount == 0:
+            break
+
+        last_id = db.execute(
+            "SELECT MAX(id) FROM events WHERE id > %s AND amount_cents IS NOT NULL",
+            (last_id,)
+        ).fetchone()[0] or last_id
+        time.sleep(0.05)
+```
+
+### Phase 4: Classify NULL Rows Before Cutover
+
+Do not assume `NULL` in the new column means the backfill missed it. Categorise every remaining `NULL`:
+
+```sql
+SELECT
+    CASE
+        WHEN payload IS NULL                    THEN 'null_payload'
+        WHEN NOT (payload ? 'amount')           THEN 'field_absent'
+        WHEN payload->>'amount' = ''            THEN 'empty_string'
+        WHEN payload->>'amount' !~ '^[0-9.]+$' THEN 'non_numeric'
+        ELSE 'backfill_missed'
+    END         AS null_reason,
+    COUNT(*)    AS row_count
+FROM events
+WHERE amount_cents IS NULL
+GROUP BY 1
+ORDER BY row_count DESC;
+```
+
+Each category requires a business decision before flipping reads. `field_absent` may legitimately map to `0` or `NULL` — but that is a product decision, not a migration assumption.
+
+### Phase 5: Divergence Check
+
+```sql
+-- Verify extracted values match the source blob on a random 1% sample
+SELECT id, payload->>'amount' AS blob_value, amount_cents
+FROM events
+TABLESAMPLE BERNOULLI(1)
+WHERE amount_cents IS NOT NULL
+  AND (payload->>'amount')::NUMERIC * 100 != amount_cents
+LIMIT 100;
+-- Zero rows = extraction consistent. Any rows = fix the backfill first.
+```
+
+---
+
+## 16. ENUM Type Migrations
+
+### The Transaction Block Problem
+
+PostgreSQL ENUM types have a hard constraint: **`ALTER TYPE ... ADD VALUE` cannot execute inside a transaction block**.
+
+This is not a locking concern — it is a parser-level restriction. If your migration runner wraps scripts in `BEGIN ... COMMIT` (as Flyway, Alembic, and most runners do by default), adding a value to an ENUM will fail immediately:
+
+```
+ERROR: ALTER TYPE ... ADD VALUE cannot run inside a transaction block
+```
+
+The entire deployment halts. The runner marks the migration as failed and stops.
+
+### Safe: Adding an ENUM Value (Non-Transactional)
+
+```sql
+-- Must be a standalone autocommit statement — NOT inside BEGIN/COMMIT
+ALTER TYPE order_status ADD VALUE IF NOT EXISTS 'refunded' AFTER 'completed';
+```
+
+**In Flyway**, annotate the migration file to disable the implicit transaction:
+
+```sql
+-- V7__add_refunded_status.sql
+-- flyway:nonTransactional
+ALTER TYPE order_status ADD VALUE IF NOT EXISTS 'refunded' AFTER 'completed';
+```
+
+**In Alembic**, use `AUTOCOMMIT` isolation for the specific statement:
+
+```python
+def upgrade():
+    connection = op.get_bind()
+    connection.execution_options(isolation_level="AUTOCOMMIT").execute(
+        "ALTER TYPE order_status ADD VALUE IF NOT EXISTS 'refunded' AFTER 'completed'"
+    )
+```
+
+### Dangerous: Removing or Renaming an ENUM Value
+
+PostgreSQL has **no direct DDL for removing or renaming an ENUM value**:
+
+```
+ERROR: cannot drop value from an enum type
+```
+
+The only safe path is a full Expand/Contract cycle on the type:
+
+```sql
+-- Step 1: Create a new type with the desired final values
+CREATE TYPE order_status_v2 AS ENUM ('pending', 'completed', 'refunded');
+
+-- Step 2: Add a new column using the new type (nullable, for Expand)
+ALTER TABLE orders ADD COLUMN status_v2 order_status_v2 NULL;
+
+-- Step 3: Backfill — map old values to new with explicit business rules
+UPDATE orders
+SET status_v2 = CASE
+    WHEN status::TEXT = 'cancelled' THEN 'completed'   -- map removed value
+    ELSE status::TEXT::order_status_v2
+END
+WHERE status_v2 IS NULL;
+
+-- Step 4: After divergence check + read cutover (Contract):
+ALTER TABLE orders DROP COLUMN status;
+ALTER TABLE orders RENAME COLUMN status_v2 TO status;
+DROP TYPE order_status;
+ALTER TYPE order_status_v2 RENAME TO order_status;
+```
+
+> **Only `ALTER TYPE ... ADD VALUE` requires autocommit. All other steps in this cycle execute normally inside transactions.**
+
+### ENUM vs VARCHAR + CHECK — When to Choose Each
+
+| Approach | Add Value | Remove Value | Rename Value | Cross-DB Portable |
+|---|---|---|---|---|
+| `ENUM` type | Non-transactional DDL | Full Expand/Contract | Full Expand/Contract | No |
+| `VARCHAR` + `CHECK` | New migration (in-transaction) | New migration | New migration | Yes |
+| Reference table (FK) | `INSERT` — no DDL at all | `DELETE` or soft-delete | `UPDATE` — no DDL | Yes |
+
+If ENUM values change more than twice a year, a reference table or `VARCHAR + CHECK` is almost always lower-risk.
+
+---
+
+## 17. Sentinel Values in Dual-Write Migrations
+
+### The NULL Ambiguity Problem
+
+Section 4 uses `NULL` as the signal that a row has not yet been processed by the new logic. This works when `NULL` has no pre-existing business meaning. It breaks when `NULL` is already a valid, intentional data state.
+
+> **Real Example: Migrating `notification_preferences`**
+>
+> Old schema: a JSONB `preferences` blob. New schema: `email_opt_in BOOLEAN`.
+>
+> Business rules: `NULL` means "user has not yet set a preference" (valid, ongoing). `TRUE` = opted in. `FALSE` = opted out.
+>
+> The backfill guard `WHERE email_opt_in IS NULL` processes unmigrated rows correctly. But after cutover, new users are also written with `NULL` — which is a valid ongoing state. The backfill job begins re-processing live users. The divergence check cannot distinguish "not yet migrated" from "genuinely unset preference."
+
+### The Fix: Use a Dedicated Migration-Tracking Column
+
+Do not overload `NULL`. Add an explicit `_migrated` boolean that carries the migration state independently from the data value:
+
+```sql
+ALTER TABLE users ADD COLUMN email_opt_in          BOOLEAN NULL;
+ALTER TABLE users ADD COLUMN _email_pref_migrated  BOOLEAN NOT NULL DEFAULT FALSE;
+```
+
+```sql
+-- Backfill: process only unmigrated rows, not business-logic NULLs
+UPDATE users
+SET
+    email_opt_in         = (preferences->>'email_notifications')::BOOLEAN,
+    _email_pref_migrated = TRUE
+WHERE _email_pref_migrated = FALSE
+  AND id > %(last_id)s
+ORDER BY id
+LIMIT %(batch_size)s;
+```
+
+```sql
+-- Divergence check: are migrated rows consistent with source?
+SELECT COUNT(*) FROM users
+WHERE _email_pref_migrated = TRUE
+  AND email_opt_in IS DISTINCT FROM (preferences->>'email_notifications')::BOOLEAN;
+-- Expected: 0
+```
+
+Application code during transition falls back to the old source for unmigrated rows:
+
+```python
+def get_email_preference(user_id):
+    row = db.execute(
+        "SELECT email_opt_in, _email_pref_migrated FROM users WHERE id = %s", (user_id,)
+    ).fetchone()
+    if row["_email_pref_migrated"]:
+        return row["email_opt_in"]
+    return read_from_preferences_blob(user_id)   # fall back to JSONB
+```
+
+### Out-of-Range Sentinels for Numeric and Text Columns
+
+When a separate tracking column is impractical, use an out-of-range value that cannot appear in production data:
+
+```sql
+-- INTEGER: -1 is unambiguous for count/amount columns
+ALTER TABLE orders ADD COLUMN item_count_v2 INTEGER NOT NULL DEFAULT -1;
+-- Backfill guard: WHERE item_count_v2 = -1
+
+-- TEXT: a magic string no real value would ever match
+ALTER TABLE products ADD COLUMN sku_v2 VARCHAR(50) NOT NULL DEFAULT '__PENDING_MIGRATION__';
+-- Backfill guard: WHERE sku_v2 = '__PENDING_MIGRATION__'
+```
+
+### Sentinel Lifecycle — Clean Up After Migration
+
+```sql
+-- Verify no sentinels remain before decommissioning the tracking infrastructure
+SELECT COUNT(*) FROM users WHERE _email_pref_migrated = FALSE;   -- Expected: 0
+SELECT COUNT(*) FROM orders WHERE item_count_v2 = -1;            -- Expected: 0
+
+-- Drop tracking column as part of the Contract phase
+ALTER TABLE users DROP COLUMN _email_pref_migrated;
+```
+
+Sentinels left in production become sources of future confusion and incorrect query results. Clean-up is a required step of the Contract phase, not an afterthought.
+
+
+## 18. Versioned Migration System
+
+Every schema change should be a **versioned, immutable artifact** — tracked in version control and in a database history table so you always know exactly what state the schema is in.
 
 ### File Naming Convention
 
@@ -1306,22 +1600,11 @@ migrations/
 ├── V1__create_users_table.sql
 ├── V2__add_email_index.sql
 ├── V3__add_verified_at_column.sql
-├── V4__create_orders_table.sql
-├── V5__add_order_status_index.sql
 └── rollback/
-    ├── V3__rollback.sql
-    ├── V4__rollback.sql
-    └── V5__rollback.sql
+    └── V3__rollback.sql
 ```
 
-- **`V{n}__`** — version number, monotonically increasing, no gaps
-- **`{description}`** — snake_case, describes what the migration does
-- **`.sql`** — or `.py`, `.java` for programmatic migrations
-
-**The three immutable rules:**
-1. Never edit a migration file that has been applied in any environment. Write a new one.
-2. Never delete a migration file. The history must be complete and linear.
-3. Never apply migrations out of order. `V5` must always follow `V4`.
+**Three immutable rules:** Never edit a migration that has been applied in any environment. Never delete one. Never apply out of order.
 
 ### Schema History Table
 
@@ -1329,73 +1612,37 @@ migrations/
 CREATE TABLE schema_migrations (
     version        VARCHAR(50)  PRIMARY KEY,
     description    TEXT         NOT NULL,
-    script         TEXT         NOT NULL,          -- filename
-    checksum       VARCHAR(64),                    -- SHA-256 of file contents
+    script         TEXT         NOT NULL,
+    checksum       VARCHAR(64),
     applied_by     VARCHAR(100),
     applied_at     TIMESTAMP    DEFAULT NOW(),
     execution_ms   INTEGER,
-    status         VARCHAR(20)  DEFAULT 'success'  -- success | failed
+    status         VARCHAR(20)  DEFAULT 'success'
 );
-
--- What version is the schema at right now?
-SELECT version, description, applied_at
-FROM schema_migrations
-ORDER BY applied_at DESC LIMIT 1;
-
--- Has a specific migration been applied?
-SELECT EXISTS (
-    SELECT 1 FROM schema_migrations
-    WHERE version = 'V5' AND status = 'success'
-) AS is_applied;
 ```
 
 ### Checksum Enforcement
 
-A checksum is a cryptographic fingerprint of the migration file. Storing it and re-verifying on every run catches accidental edits to files that have already been applied:
-
 ```python
 import hashlib
-
-def compute_checksum(filepath: str) -> str:
-    with open(filepath, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
 
 def verify_migration_integrity(db, migrations_dir: str) -> None:
     applied = db.execute(
         "SELECT script, checksum FROM schema_migrations WHERE status = 'success'"
     ).fetchall()
-
     for row in applied:
         filepath = f"{migrations_dir}/{row['script']}"
-        current  = compute_checksum(filepath)
+        current  = hashlib.sha256(open(filepath, "rb").read()).hexdigest()
         if current != row["checksum"]:
-            raise RuntimeError(
-                f"INTEGRITY VIOLATION: {row['script']} was modified after being applied.\n"
-                f"  Stored:  {row['checksum'][:16]}...\n"
-                f"  Current: {current[:16]}..."
-            )
-
-    print(f"✅ {len(applied)} migration checksums verified — all intact.")
+            raise RuntimeError(f"INTEGRITY VIOLATION: {row['script']} was modified after being applied.")
+    print(f"✅ {len(applied)} migration checksums verified.")
 ```
 
 ---
 
-## 15. Central Migration Registry
+## 19. Central Migration Registry
 
-### What Is It?
-
-In a microservices architecture, each service owns its own database. Without coordination, migrations happen in isolation. Nobody knows which services are mid-migration, which have failed, or whether a cross-service change is creating inconsistencies.
-
-A **Central Migration Registry** is a shared store that every service reports migration status to — giving the platform team a single view across the entire system.
-
-### Why You Need One at Scale
-
-| Without Registry | With Registry |
-|---|---|
-| No visibility into which services are mid-migration | Dashboard shows every service's current migration state |
-| Cross-service dependencies are implicit and unenforced | Dependencies are declared, checked, and blocked if not satisfied |
-| A failed migration in Service A silently breaks Service B | Registry detects and alerts on downstream impact |
-| No audit trail of who ran what in production | Full history: actor, timestamp, duration, result |
+In a microservices architecture, a **Central Migration Registry** gives the platform team a single view across all services — which are mid-migration, which have failed, and whether cross-service dependencies are satisfied.
 
 ### Registry Schema
 
@@ -1404,76 +1651,14 @@ CREATE TABLE migration_registry (
     id               SERIAL       PRIMARY KEY,
     service_name     VARCHAR(100) NOT NULL,
     version          VARCHAR(50)  NOT NULL,
-    description      TEXT,
-    status           VARCHAR(20)  NOT NULL,  -- pending|running|success|failed|rolled_back
-    environment      VARCHAR(20)  NOT NULL,  -- dev|staging|production
+    status           VARCHAR(20)  NOT NULL,
+    environment      VARCHAR(20)  NOT NULL,
     started_at       TIMESTAMP,
     completed_at     TIMESTAMP,
     duration_ms      INTEGER,
     applied_by       VARCHAR(100),
-    rollback_version VARCHAR(50),
-    notes            TEXT,
     UNIQUE (service_name, version, environment)
 );
-
-CREATE TABLE migration_dependencies (
-    service_name       VARCHAR(100) NOT NULL,
-    version            VARCHAR(50)  NOT NULL,
-    depends_on_service VARCHAR(100) NOT NULL,
-    depends_on_version VARCHAR(50)  NOT NULL,
-    PRIMARY KEY (service_name, version, depends_on_service, depends_on_version)
-);
-```
-
-### Reporting From a Service
-
-```python
-import requests
-from datetime import datetime, timezone
-
-class MigrationRegistry:
-    def __init__(self, registry_url: str, service_name: str, environment: str):
-        self.url     = registry_url
-        self.service = service_name
-        self.env     = environment
-
-    def _now(self) -> str:
-        return datetime.now(timezone.utc).isoformat()
-
-    def report_started(self, version: str, description: str, applied_by: str) -> None:
-        requests.post(f"{self.url}/migrations", json={
-            "service_name": self.service,
-            "version": version,
-            "description": description,
-            "status": "running",
-            "environment": self.env,
-            "applied_by": applied_by,
-            "started_at": self._now(),
-        })
-
-    def report_completed(self, version: str, duration_ms: int) -> None:
-        requests.patch(f"{self.url}/migrations/{self.service}/{version}", json={
-            "status": "success",
-            "duration_ms": duration_ms,
-            "completed_at": self._now(),
-        })
-
-    def report_failed(self, version: str, error: str) -> None:
-        requests.patch(f"{self.url}/migrations/{self.service}/{version}", json={
-            "status": "failed",
-            "notes": error,
-            "completed_at": self._now(),
-        })
-
-# Usage
-registry = MigrationRegistry("https://platform-registry.internal", "order-service", "production")
-registry.report_started("V12", "Add shipped_at column", applied_by="gugan")
-try:
-    run_migration("V12__add_shipped_at.sql")
-    registry.report_completed("V12", duration_ms=450)
-except Exception as e:
-    registry.report_failed("V12", str(e))
-    raise
 ```
 
 ### Enforcing Cross-Service Dependencies
@@ -1485,308 +1670,119 @@ def assert_dependencies_met(db, service_name: str, version: str) -> None:
         FROM migration_dependencies
         WHERE service_name = %s AND version = %s
     """, (service_name, version)).fetchall()
-
     for dep in deps:
         result = db.execute("""
             SELECT status FROM migration_registry
             WHERE service_name = %s AND version = %s AND environment = 'production'
         """, (dep["depends_on_service"], dep["depends_on_version"])).fetchone()
-
         if not result or result["status"] != "success":
             raise RuntimeError(
                 f"Cannot run {service_name} {version}: "
-                f"requires {dep['depends_on_service']} {dep['depends_on_version']} "
-                f"to complete in production first."
+                f"requires {dep['depends_on_service']} {dep['depends_on_version']} first."
             )
 ```
 
 ---
 
-## 16. Migration Runner
+## 20. Migration Runner
 
-### What Is a Migration Runner?
-
-A migration runner executes migrations — reads pending scripts, applies them in version order, records results, and halts on failure. It is the bridge between your migration files and your database.
-
-Most migration tools bundle a runner (Flyway, Liquibase, Alembic). Understanding what a runner must guarantee — and building a minimal one — demystifies the tooling and helps you handle edge cases safely.
-
-### What Every Runner Must Guarantee
-
-1. **Mutual exclusion** — if two deployments start simultaneously, only one runs migrations; the other waits.
-2. **History awareness** — reads the history table to determine which migrations are pending.
-3. **Checksum verification** — re-validates checksums of all previously applied migrations.
-4. **Ordered application** — applies pending migrations strictly in version order.
-5. **Stop on failure** — rolls back the current transaction and halts immediately; never skips a failed migration.
+A migration runner executes migrations in version order, records results, and halts on failure. It must guarantee: mutual exclusion, history awareness, checksum verification, ordered application, and stop-on-failure.
 
 ### Minimal Runner (Python + PostgreSQL)
 
 ```python
-import os
-import hashlib
-import time
-import psycopg2
-import psycopg2.extras
+import os, hashlib, time, psycopg2, psycopg2.extras
 
 class MigrationRunner:
-    ADVISORY_LOCK_KEY = 9876543210  # arbitrary unique bigint
+    ADVISORY_LOCK_KEY = 9876543210
 
-    def __init__(self, db_url: str, migrations_dir: str):
+    def __init__(self, db_url, migrations_dir):
         self.conn = psycopg2.connect(db_url, cursor_factory=psycopg2.extras.DictCursor)
         self.dir  = migrations_dir
         self._ensure_history_table()
 
-    def _ensure_history_table(self) -> None:
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version     VARCHAR(50) PRIMARY KEY,
-                    description TEXT,
-                    checksum    VARCHAR(64),
-                    applied_at  TIMESTAMP DEFAULT NOW(),
-                    duration_ms INTEGER,
-                    status      VARCHAR(20) DEFAULT 'success'
-                )
-            """)
-        self.conn.commit()
-
-    def _acquire_lock(self) -> None:
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (self.ADVISORY_LOCK_KEY,))
-            if not cur.fetchone()[0]:
-                raise RuntimeError(
-                    "Another migration runner is already active. Aborting."
-                )
-
-    def _release_lock(self) -> None:
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_unlock(%s)", (self.ADVISORY_LOCK_KEY,))
-
-    def _applied_versions(self) -> set:
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT version FROM schema_migrations WHERE status = 'success'")
-            return {row["version"] for row in cur.fetchall()}
-
-    def _checksum(self, path: str) -> str:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-
-    def _pending_files(self) -> list:
-        applied   = self._applied_versions()
-        all_files = sorted(
-            f for f in os.listdir(self.dir)
-            if f.startswith("V") and f.endswith(".sql")
-        )
-        return [f for f in all_files if f.split("__")[0] not in applied]
-
-    def run(self) -> None:
+    def run(self):
         self._acquire_lock()
         try:
-            pending = self._pending_files()
-            if not pending:
-                print("No pending migrations.")
-                return
-
-            for filename in pending:
+            for filename in self._pending_files():
                 version  = filename.split("__")[0]
-                desc     = filename.split("__")[1].replace(".sql", "").replace("_", " ")
                 filepath = os.path.join(self.dir, filename)
-                checksum = self._checksum(filepath)
-
-                print(f"Applying {version}: {desc} ...", end=" ", flush=True)
+                checksum = hashlib.sha256(open(filepath, "rb").read()).hexdigest()
                 t0 = time.time()
                 try:
-                    with open(filepath) as f:
-                        sql = f.read()
                     with self.conn.cursor() as cur:
-                        cur.execute(sql)
+                        cur.execute(open(filepath).read())
                         cur.execute(
-                            "INSERT INTO schema_migrations "
-                            "(version, description, checksum, duration_ms) "
-                            "VALUES (%s, %s, %s, %s)",
-                            (version, desc, checksum, int((time.time() - t0) * 1000))
+                            "INSERT INTO schema_migrations (version, checksum, duration_ms) VALUES (%s,%s,%s)",
+                            (version, checksum, int((time.time()-t0)*1000))
                         )
                     self.conn.commit()
-                    print(f"✅  ({int((time.time() - t0) * 1000)}ms)")
+                    print(f"✅  {version} ({int((time.time()-t0)*1000)}ms)")
                 except Exception as e:
                     self.conn.rollback()
-                    print(f"❌  FAILED: {e}")
-                    raise   # halt immediately — never skip to the next migration
+                    print(f"❌  {version} FAILED: {e}")
+                    raise
         finally:
             self._release_lock()
 ```
 
 ### CI/CD Integration
 
-The runner runs before the new application version starts serving traffic:
-
 ```yaml
-# .github/workflows/deploy.yml
 jobs:
   deploy:
     steps:
       - name: Run database migrations
         run: python migrate.py --env production
-        env:
-          DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
-
       - name: Verify no pending migrations remain
         run: python migrate.py --pending --expect-zero
-
       - name: Deploy application
         run: kubectl apply -f k8s/deployment.yaml
-        # Only executes if both previous steps succeeded
-```
-
-### Advisory Locks for Concurrent Safety
-
-PostgreSQL advisory locks prevent two runner instances from applying migrations simultaneously:
-
-```sql
--- Attempt to acquire (non-blocking) — returns TRUE if acquired, FALSE if held by another
-SELECT pg_try_advisory_lock(9876543210);
-
--- Release when done
-SELECT pg_advisory_unlock(9876543210);
-
--- Blocking version — waits until lock is available
-SELECT pg_advisory_lock(9876543210);
 ```
 
 ---
 
-## 17. Infrastructure-Level Migrations
-
-The previous sections cover schema and data migrations within a single database instance. Infrastructure-level migrations operate at a larger scope: moving between engines, restructuring the hosting topology, or changing how the database connects to applications.
+## 21. Infrastructure-Level Migrations
 
 ### Database Engine Migration (e.g., MySQL → PostgreSQL)
 
-Moving between engines is one of the most complex migrations possible. SQL dialects differ, data types differ, constraint semantics differ.
-
-**The four phases:**
-
-```
-Phase 1 — Schema Translation
-  Translate DDL from source dialect to target dialect.
-  Handle type differences:
-    MySQL TINYINT    → PostgreSQL SMALLINT or BOOLEAN
-    MySQL ENUM       → PostgreSQL custom TYPE or VARCHAR + CHECK
-    AUTO_INCREMENT   → SERIAL or GENERATED ALWAYS AS IDENTITY
-    DATETIME         → TIMESTAMP
-  Validate that constraint behaviour is identical in both engines.
-
-Phase 2 — Data Migration (choose offline or live)
-  Offline (Big Bang): pg_dump + pgLoader — requires maintenance window
-  Live (CDC): AWS DMS or Debezium streams changes continuously;
-              application dual-writes to both engines during cutover
-
-Phase 3 — Application Cutover
-  Update connection strings.
-  Audit every query — SQL valid in MySQL may be invalid in PostgreSQL
-  (MySQL permits non-aggregated columns in GROUP BY; PostgreSQL does not).
-  Run full regression test suite against the new engine.
-
-Phase 4 — Validation
-  Row count match across all tables.
-  Checksum comparison on a random row sample per table.
-  Application error rate back to baseline.
-  All indexes, constraints, and triggers confirmed recreated.
-```
+| Phase | Key Actions |
+|---|---|
+| Schema Translation | Translate DDL; handle type differences (`TINYINT` → `SMALLINT`, `AUTO_INCREMENT` → `SERIAL`) |
+| Data Migration | Offline: `pg_dump` + `pgLoader`; Live: AWS DMS or Debezium CDC |
+| Application Cutover | Update connection strings; audit every query for dialect differences |
+| Validation | Row counts, checksum sampling, error rate baseline |
 
 | Tool | Source → Target | Notes |
 |---|---|---|
-| **AWS DMS** | MySQL, Oracle, MSSQL → PostgreSQL / Aurora | Managed; supports full-load and CDC live replication |
-| **pgLoader** | MySQL, SQLite, CSV → PostgreSQL | Open source; handles type mapping; fast bulk load |
-| **Debezium** | MySQL, PostgreSQL, Oracle → Kafka → any | CDC-based; good for live migration with zero downtime |
-| **ora2pg** | Oracle → PostgreSQL | Specialised; handles PL/SQL to PL/pgSQL translation |
-| **gh-ost** | MySQL → MySQL | Online schema changes on MySQL without table locks |
-
-### Vertical Scaling Migration
-
-Moving from a smaller database host to a larger one. Goal: minimise the cutover window.
-
-```
-1.  Snapshot the current primary
-2.  Restore snapshot to the new (larger) instance
-3.  Configure the new instance to replicate FROM the old primary
-4.  Wait until replication lag reaches near-zero
-5.  Enable maintenance mode — stop writes to old instance
-6.  Wait until replication lag = 0 exactly
-7.  Update DNS / connection string to the new instance
-8.  Disable maintenance mode
-9.  Monitor for 30 minutes: error rate, latency, connection counts
-10. Decommission old instance once stable
-```
-
-### Multi-Region Migration
-
-**Single-region to active-passive:**
-1. Provision a replica in the new region and let it fully sync
-2. Route read traffic to the regional replica for lower latency
-3. Test failover procedure manually before relying on it
-4. Update write DNS if the primary region is also changing
-
-**Active-passive to active-active:** This is an architecture change, not a schema migration. Active-active requires a distributed database engine (CockroachDB, Spanner, Aurora Global Database) or application-level conflict resolution. Write a dedicated architecture migration playbook — do not attempt this through schema migration alone.
+| **AWS DMS** | MySQL/Oracle/MSSQL → PostgreSQL | Managed; supports full-load and CDC |
+| **pgLoader** | MySQL/SQLite/CSV → PostgreSQL | Open source; fast bulk load |
+| **Debezium** | MySQL/PostgreSQL/Oracle → Kafka | CDC-based; zero-downtime |
+| **gh-ost** | MySQL → MySQL | Online schema changes without table locks |
 
 ### Adding a Connection Pooler (e.g., PgBouncer)
 
-Adding a connection pooler affects every service connected to the database. Migrate incrementally:
+Migrate incrementally — deploy alongside, test one low-traffic service first, then migrate remaining services one at a time.
 
-```
-1.  Deploy PgBouncer alongside the database — do NOT reroute traffic yet
-2.  Configure PgBouncer with the same credentials as the existing database
-3.  Test a read query through PgBouncer from a dev environment
-4.  Migrate one low-traffic, non-critical service to the PgBouncer DSN
-5.  Monitor for 24 hours: connection counts, error rates, query latency
-6.  Migrate remaining services one at a time
-7.  Decommission direct-to-database connections once all services are migrated
-```
-
-> **⚠️ Watch Out:** PgBouncer in `transaction` mode (the default for maximum pooling efficiency) does **not** support prepared statements (`PREPARE` / `EXECUTE`) or session-level advisory locks (`pg_advisory_lock`). Applications using either must switch to `session` mode pooling, or refactor those queries before the migration.
+> **⚠️ Watch Out:** PgBouncer in `transaction` mode does **not** support prepared statements or session-level advisory locks. Applications using either must switch to `session` mode or refactor before migration.
 
 ---
 
-## 18. Migration Tooling — The Full Landscape
+## 22. Migration Tooling — The Full Landscape
 
-Modern systems span relational databases, document stores, caches, message queues, and vector databases. Each requires a different migration approach.
-
----
-
-### 18.1 SQL Database Migration Tools
+### SQL Database Tools
 
 | Tool | Ecosystem | Best For |
 |---|---|---|
-| **Flyway** | Any (SQL-first) | Teams starting with migrations; plain SQL; no abstraction |
-| **Liquibase** | Any (YAML/XML/SQL) | Multi-DB; built-in rollback; enterprise audit requirements |
-| **Alembic** | Python / SQLAlchemy | Python-native teams; ORM-integrated schema management |
-| **Django Migrations** | Python / Django | Django projects — auto-generated from model changes |
-| **ActiveRecord** | Ruby / Rails | Rails projects — tightly ORM-integrated |
-| **Prisma Migrate** | TypeScript / Node.js | Declarative schema; auto-generates SQL |
-| **Sqitch** | Any | Complex dependency graphs between migrations |
-| **golang-migrate** | Go | Lightweight runner with no framework dependency |
-| **gh-ost** | MySQL | Online schema changes on MySQL without table locks |
-| **pt-online-schema-change** | MySQL | Percona's online schema change tool for MySQL |
-| **AWS DMS** | Managed | Heterogeneous migrations with CDC (Oracle → PostgreSQL etc.) |
+| **Flyway** | Any (SQL-first) | Teams starting with migrations; plain SQL |
+| **Liquibase** | Any (YAML/XML/SQL) | Multi-DB; built-in rollback; enterprise audit |
+| **Alembic** | Python / SQLAlchemy | Python-native teams |
+| **Django Migrations** | Python / Django | Auto-generated from model changes |
+| **Prisma Migrate** | TypeScript / Node.js | Declarative schema |
+| **gh-ost** | MySQL | Online schema changes without locks |
+| **AWS DMS** | Managed | Heterogeneous migrations with CDC |
 
-**Flyway vs Liquibase at a glance:**
-
-| Criterion | Flyway | Liquibase |
-|---|---|---|
-| Migration format | SQL files | YAML / XML / SQL |
-| Built-in rollback | No — write your own | Yes — declared per changeset |
-| Conditional logic | Requires Java callback | Native preconditions |
-| Multi-database support | Limited | Strong |
-| Auditability | Basic history table | Detailed changelog with tags |
-| Best for | Simple schemas; full SQL control | Multi-DB; audit requirements; rollback-first |
-
-> **💡 Recommendation:** Start with Flyway. It forces you to write and understand real SQL. Graduate to Liquibase when you need conditional changesets, multi-database support, or first-class rollback blocks.
-
----
-
-### 18.2 NoSQL Migration Tools
-
-NoSQL databases are "schemaless" — but that does not mean migrations are unnecessary. The schema lives in application code; when that code changes, existing documents no longer match. That is a migration problem.
-
-**Mongock** (MongoDB, DynamoDB, CosmosDB):
+### NoSQL Migration (Mongock)
 
 ```java
 @ChangeUnit(id = "add-verified-at", order = "002", author = "gugan")
@@ -1801,172 +1797,80 @@ public class AddVerifiedAtMigration {
     @RollbackExecution
     public void rollback(MongoDatabase db) {
         db.getCollection("users").updateMany(
-            Filters.exists("verified_at"),
-            Updates.unset("verified_at")
+            Filters.exists("verified_at"), Updates.unset("verified_at")
         );
     }
 }
 ```
 
-**Three document-store migration patterns:**
+### Kafka Schema Migration
 
-- **Migrate-on-read (lazy):** Upgrade a document the first time it is read. *Risk:* Documents never read stay in the old format indefinitely.
-- **Schema version field:** Embed `schema_version` in every document; application code branches on it.
-- **Background bulk migration:** Same as the SQL batched backfill — process documents in batches with throttling and an idempotency guard.
-
----
-
-### 18.3 Redis Migration
-
-Redis has no DDL — but key naming conventions and data structure types still need migration.
-
-```python
-def get_user_session(user_id: str):
-    session = redis.get(f"session:v2:{user_id}")              # try new key format
-    if session is None:
-        session = redis.get(f"session:{user_id}")             # fall back to old
-        if session:
-            redis.set(f"session:v2:{user_id}", session, ex=3600)  # promote to new
-    return session
-
-def set_user_session(user_id: str, data: bytes) -> None:
-    redis.set(f"session:{user_id}",    data, ex=3600)         # old — backward compat
-    redis.set(f"session:v2:{user_id}", data, ex=3600)         # new — forward progress
-```
-
-| Tool | What It Does |
-|---|---|
-| **RIOT (Redis I/O Tools)** | Official Redis tool; live key migration between Redis instances |
-| **redis-migrate-tool** | Open source; migrates with key pattern filtering |
-| **AWS DMS** | Supports Redis as a source for migration to other targets |
-
-> **⚠️ Watch Out:** Redis TTLs are **not automatically preserved** during migration. Keys that arrive without a TTL may never expire (memory leak) or expire too soon (session loss). Verify TTL handling explicitly for every migration approach.
-
----
-
-### 18.4 Kafka & Message Queue Migration
-
-Kafka topics and their message schemas must be migrated as carefully as any database schema. A breaking schema change on a Kafka topic causes consumers to fail to deserialize messages — silently or with errors — cascading failures across every service that reads from that topic.
-
-**Confluent Schema Registry compatibility modes:**
-
-| Mode | What It Enforces | When to Use |
+| Compatibility Mode | Enforces | When to Use |
 |---|---|---|
-| `BACKWARD` (default) | New schema can deserialize old messages | Upgrade consumers before producers |
-| `FORWARD` | Old schema can deserialize new messages | Upgrade producers before consumers |
-| `FULL` | Both backward and forward compatible | Safest; most restrictive |
-| `NONE` | No compatibility check | Development only — never production |
+| `BACKWARD` (default) | New schema reads old messages | Upgrade consumers before producers |
+| `FORWARD` | Old schema reads new messages | Upgrade producers before consumers |
+| `FULL` | Both directions | Safest; most restrictive |
+| `NONE` | No check | Development only — never production |
 
-**Safe Avro evolution:**
-```
-✅ Safe (backward compatible):
-   Add an optional field with a default value
-   Remove a field that already had a default
+### Vector Database Migration
 
-❌ Breaking (requires a new topic):
-   Rename a field
-   Change a field type (int → string)
-   Add a required field with no default
-   Remove a required field
-```
+Embeddings are **model-specific** — vectors from one model are numerically incompatible with another. When changing embedding models, every vector must be regenerated from source text.
 
-**For breaking schema changes — dual-topic migration:**
 ```python
-def emit_event(event):
-    producer.send("user-events",    serialize_v1(event))  # old consumers still work
-    producer.send("user-events-v2", serialize_v2(event))  # new consumers use this
-# Migrate consumers one-by-one to user-events-v2, then retire user-events
-```
-
-| Tool | What It Does |
-|---|---|
-| **Confluent Schema Registry** | Stores schemas, enforces compatibility per topic |
-| **MirrorMaker 2** | Apache-native topic replication across Kafka clusters |
-| **Kafka Connect** | Data migration between Kafka and external systems |
-
----
-
-### 18.5 Vector Database Migration
-
-Vector databases store high-dimensional embeddings for AI applications. Migrations are uniquely constrained: **embeddings are model-specific**. Vectors generated by one model are numerically incompatible with vectors generated by another. If you change your embedding model, every vector must be regenerated from source text.
-
-| Trigger | Example |
-|---|---|
-| Scaling beyond current DB limits | pgvector slowing at 50M+ vectors |
-| Changing the embedding model | `ada-002` → `text-embedding-3-large` |
-| Cost or vendor change | Pinecone (managed) → Qdrant (self-hosted) |
-| Adding hybrid search | Moving to a DB supporting vector + keyword together |
-
-**Migration pattern when changing embedding model:**
-```python
-import time
-
-def migrate_vectors(source_db, target_db, new_model, batch_size: int = 100) -> None:
-    """Cannot copy raw vectors — models differ. Must re-embed from source text."""
+def migrate_vectors(source_db, target_db, new_model, batch_size=100):
     offset = 0
     while True:
         docs = source_db.query(
-            "SELECT id, document_text, metadata FROM documents "
-            "ORDER BY id LIMIT %s OFFSET %s",
+            "SELECT id, document_text, metadata FROM documents ORDER BY id LIMIT %s OFFSET %s",
             (batch_size, offset)
         ).fetchall()
         if not docs:
             break
-
         new_vectors = new_model.embed_batch([d["document_text"] for d in docs])
         target_db.upsert(collection_name="documents", points=[
             {"id": d["id"], "vector": v, "payload": d["metadata"]}
             for d, v in zip(docs, new_vectors)
         ])
         offset += batch_size
-        time.sleep(0.1)   # throttle embedding API rate limits
+        time.sleep(0.1)
 ```
-
-> **💡 Tip:** If keeping the same embedding model and only migrating between two databases that support compatible vector formats, you can copy raw vectors. If changing models simultaneously, you must re-embed — these are two separate operations even when they happen at the same time.
-
-| Vector DB | Type | Best For |
-|---|---|---|
-| **pgvector** | PostgreSQL extension | Teams already on Postgres; under 10M vectors |
-| **Qdrant** | Open source (Rust) | High performance; complex metadata filtering |
-| **Pinecone** | Managed SaaS | Zero-ops; enterprise scale |
-| **Weaviate** | Open source | Hybrid search (vector + keyword combined) |
-| **Milvus / Zilliz** | Open source / managed | Billions of vectors; GPU-accelerated |
-| **Chroma** | Open source | Local development and prototyping |
 
 ---
 
-## 19. Migration Runbook Template
+## 23. Migration Runbook Template
 
-Every migration that touches a live table or collection with more than 100K rows deserves a written runbook. A second engineer must review it before anything runs.
+Every migration touching a live table or collection with more than 100K rows deserves a written runbook. A second engineer must review it before anything runs.
 
 ```markdown
 # Migration Runbook: [Short Description]
 
 ## Summary
-One paragraph: what does this migration do, why is it needed now,
-and what is the expected impact if it goes wrong?
+One paragraph: what does this migration do, why is it needed, what is the expected impact if wrong?
 
 ## Risk Level
 - [ ] Low    — Additive only (nullable column, new table, CONCURRENTLY index)
-- [ ] Medium — Data backfill required; schema change on an active table
-- [ ] High   — Destructive change; FK or check constraint on a large table; type change
+- [ ] Medium — Data backfill required; schema change on active table
+- [ ] High   — Destructive change; FK or check constraint on large table; type change
 
 ## Pre-Migration Checklist
 - [ ] Row count checked on production: ___________
 - [ ] Estimated duration recorded (tested on staging at prod scale): ___________
-- [ ] Disk space verified: ___________  (2× table size free for rewrites)
+- [ ] Disk space verified: ___________ (2× table size free for rewrites; 1.5× for backfills)
+- [ ] Autovacuum health checked: n_dead_tup baseline recorded, autovacuum not disabled
+- [ ] TXID age checked: age(datfrozenxid) < 1B before starting
 - [ ] Snapshot taken — ID: ___________
 - [ ] Rollback script written, reviewed, and tested on staging
-- [ ] `lock_timeout` confirmed in migration session config
+- [ ] `lock_timeout = '5s'` set at top of migration script
 - [ ] On-call engineer available and aware
-- [ ] Monitoring dashboards open: DB CPU, replication lag, lock wait count, app error rate
+- [ ] Monitoring dashboards open: DB CPU, replication lag, n_dead_tup, lock wait count, app error rate
+- [ ] Column slot count checked (if using Expand/Contract on a frequently-migrated table)
 - [ ] No ongoing incidents or high-risk deployments in flight
 
 ## Migration Steps
 
 ### Step 1: [Description]
 ```sql
-SET lock_timeout = '5s';
+SET lock_timeout = '5s';   -- REQUIRED on every DDL step
 -- migration SQL here
 ```
 Expected duration: ___
@@ -1977,7 +1881,11 @@ SELECT COUNT(*) FROM users WHERE verified_at IS NULL;
 ```
 
 ### Step 2: [Backfill / Validation]
-(repeat structure above for each step)
+Monitor during backfill:
+```sql
+SELECT n_dead_tup, last_autovacuum FROM pg_stat_user_tables WHERE relname = 'users';
+-- If n_dead_tup > 20% of n_live_tup: pause and run VACUUM ANALYZE
+```
 
 ## Post-Migration Verification
 - [ ] Row counts match expected
@@ -1986,11 +1894,14 @@ SELECT COUNT(*) FROM users WHERE verified_at IS NULL;
 - [ ] Replication lag returned to baseline
 - [ ] Backfill divergence check passed (if applicable)
 - [ ] VACUUM ANALYZE run after heavy backfill
+- [ ] Index bloat checked; REINDEX CONCURRENTLY run if bloat > 30%
+- [ ] TXID age checked post-migration: not significantly higher than pre-migration baseline
 
 ## Rollback Triggers (fill in real numbers — never leave blank)
 - Auto-rollback: error rate > __% for __ consecutive minutes
 - Manual rollback: migration not complete within __ hours
 - Manual rollback: replication lag > __ seconds and not recovering
+- Manual rollback: n_dead_tup > 50% of n_live_tup and autovacuum not catching up
 
 ## Sign-Off
 Executed by: ___   At: ___   Reviewed and verified by: ___
@@ -1998,31 +1909,19 @@ Executed by: ___   At: ___   Reviewed and verified by: ___
 
 ---
 
-## 20. What Goes Wrong — Four Patterns From Production
-
-These are real failure patterns — generalised from real incidents. Every engineer should read this section before running their first migration on a live system.
-
----
+## 24. What Goes Wrong — Six Patterns From Production
 
 ### 🔥 Failure #1: "It Ran Fine in Staging"
 
-**What happened:** Staging had 50,000 rows. Production had 80 million. An `ALTER TABLE ADD COLUMN NOT NULL DEFAULT NOW()` completed in 0.3 seconds in staging. In production it rewrote every row while holding an exclusive lock for 11 minutes. Connection pool exhausted. Full service outage.
+Staging had 50,000 rows. Production had 80 million. An `ALTER TABLE ADD COLUMN NOT NULL DEFAULT NOW()` completed in 0.3 seconds in staging. In production it held an exclusive lock for 11 minutes. Connection pool exhausted. Full service outage.
 
-**Root cause:** The team confirmed the migration was *correct*. They did not confirm how long it would take at *production scale*.
-
-**The rule:** Always check row count before any migration on a live table.
-```sql
-SELECT COUNT(*) FROM users;
--- If > 1,000,000 on a live system: use Expand/Contract, not a direct ALTER TABLE.
-```
+**The rule:** Always check row count before any migration on a live table. If > 1,000,000 on a live system: use Expand/Contract, not a direct `ALTER TABLE`.
 
 ---
 
 ### 🔥 Failure #2: "The Rollback Made Things Worse"
 
-**What happened:** A team dropped a column (Phase 3) while Kubernetes was mid-rolling-deploy. For 4 minutes, old pods (that still read the column) ran alongside new pods (that did not). Old pods crashed. The rollback re-added the column. New pods crashed on the re-added column. Rollback of the rollback: 8 more minutes. Total outage: 12 minutes.
-
-**Root cause:** The team assumed deployment was atomic. Rolling deployments are not — both N and N-1 app versions are live simultaneously for several minutes.
+A team dropped a column (Phase 3) while Kubernetes was mid-rolling-deploy. Old pods (still reading the column) crashed. The rollback re-added the column. New pods crashed on the re-added column. Total outage: 12 minutes.
 
 **The rule:** Never run Phase 3 (DROP COLUMN) until the rolling deploy is 100% complete and the old version is fully retired.
 
@@ -2030,15 +1929,13 @@ SELECT COUNT(*) FROM users;
 
 ### 🔥 Failure #3: "The Backfill Finished But the Data Was Wrong"
 
-**What happened:** A 3-day backfill populated `normalized_email` from `raw_email`. During those 3 days, some users updated their email. The backfill used the value captured at job-start time. 0.3% of rows ended up with stale normalised email. Team cut reads without a divergence check. Incorrect search results. Required a second backfill plus a full reindex.
-
-**Root cause:** "Completed without errors" was mistaken for "data is correct".
+A 3-day backfill populated `normalized_email`. During those 3 days, some users updated their email. The backfill used values captured at job-start. 0.3% of rows ended up with stale data. Team cut reads without a divergence check.
 
 **The rule:** Always run the divergence check before every read cutover.
+
 ```sql
 SELECT id, raw_email, normalized_email FROM users
-WHERE normalized_email != LOWER(TRIM(raw_email))
-LIMIT 100;
+WHERE normalized_email != LOWER(TRIM(raw_email)) LIMIT 100;
 -- If ANY rows returned: do NOT cut over. Fix the backfill first.
 ```
 
@@ -2046,37 +1943,76 @@ LIMIT 100;
 
 ### 🔥 Failure #4: "The Lock Queue Took Down the Application"
 
-**What happened:** A team queued an `ALTER TABLE users ADD COLUMN ...` (needing `AccessExclusiveLock`) behind a long-running analytics report (holding a `ShareLock`). The analytics query had 4 minutes left to run. Every new application query needing any lock on `users` queued behind the waiting `ALTER TABLE`. Within 30 seconds the connection pool was full. The application stopped responding for 4 minutes — not because the migration was wrong, but because it silently queued behind another process.
+An `ALTER TABLE` (needing `AccessExclusiveLock`) queued behind a 4-minute analytics query. Every new query to the table queued behind the waiting `ALTER TABLE`. Connection pool full in 30 seconds. 4-minute application outage — not from the migration itself, but from the lock queue.
 
-**Root cause:** The team ran the migration without checking for long-running queries already holding locks on the table.
-
-**The rule:** Set `lock_timeout` before every DDL statement, and run a pre-migration lock check.
-```sql
--- Fail fast if lock cannot be acquired in 5 seconds
--- Retry when the blocking query has finished
-SET lock_timeout = '5s';
-ALTER TABLE users ADD COLUMN verified_at TIMESTAMP NULL;
-```
+**The rule:** Set `lock_timeout = '5s'` before every DDL statement. Fail fast and retry.
 
 ---
 
-## 21. Quick Reference — Pre-Migration Checklist
+### 🔥 Failure #5: "The 'Safe' Backfill Destroyed Query Performance" ⬅️ *new*
+
+A team ran a compliant batched backfill — small batches, sleep between each, no table locks. The backfill completed without errors. Two days later, query performance on the table had degraded by 60%. Support tickets arrived. Investigation revealed that autovacuum had not been able to keep up during the backfill. The table had 40M dead tuples — over 35% of the total table size. Every index on the table had significant bloat. The table had silently doubled in size on disk.
+
+**The root cause:** The team checked the migration checklist (batch size, replication lag, lock timeout) but had no monitoring on `n_dead_tup` and had not tuned `autovacuum_vacuum_scale_factor` for the migration.
+
+**The fix:** Three steps:
+1. `VACUUM ANALYZE users;` — reclaimed dead tuples, updated statistics
+2. `REINDEX INDEX CONCURRENTLY` on all affected indexes — rebuilt bloated indexes non-blockingly
+3. Retroactively added dead-tuple monitoring to the migration runbook
+
+**The rule:** Every backfill that touches more than 1M rows must monitor `n_dead_tup` in real time, tune autovacuum for the target table before starting, and run `VACUUM ANALYZE` + check index bloat after completing.
+
+---
+
+### 🔥 Failure #6: "The ENUM Migration Brought Down the Deployment Pipeline" ⬅️ *new*
+
+A team needed to add a new value to a PostgreSQL ENUM. The SQL was correct. The migration runner was Flyway in its default configuration, wrapping every script in an implicit transaction. The migration failed with:
+
+```
+ERROR: ALTER TYPE ... ADD VALUE cannot run inside a transaction block
+```
+
+Flyway marked the version as failed and stopped the pipeline. Because the statement never executed, the schema was unchanged — but the runner now refused to proceed. Engineers spent 90 minutes diagnosing what they assumed was a locking problem before discovering the transaction-block restriction.
+
+**The root cause:** No engineer on the team knew that ENUM additions cannot run inside transactions. The Flyway documentation covers it — but only in a subsection most engineers never read.
+
+**The fix:**
+1. Mark the migration file with `-- flyway:nonTransactional`.
+2. Delete the failed version record from the Flyway history table.
+3. Re-run. A 90-second fix after a 90-minute diagnosis.
+
+**The rule:** Any migration containing `ALTER TYPE ... ADD VALUE` must be marked non-transactional. Add this to your code review checklist. See [Section 16](#16-enum-type-migrations) for the full pattern and runner-specific instructions.
+
+
+---
+
+## 25. Quick Reference — Pre-Migration Checklist
 
 Answer every question before starting. Do not proceed on any "no" or "I don't know."
 
 | # | Question | If No → |
 |---|---|---|
 | 1 | **How many rows / documents / vectors will be touched?** | If > 1M on a live system: use Expand/Contract or batched approach, not Big Bang |
-| 2 | **Does this operation lock the table?** | Use `CONCURRENTLY` for indexes; `NOT VALID` for FK constraints; set `lock_timeout` |
-| 3 | **Is there sufficient free disk space?** | 2× table size for rewrites; 1× index size for new indexes; 1.5× for heavy backfills |
-| 4 | **Will the application stay live?** | If yes → Incremental. If maintenance window is acceptable → Big Bang may be fine |
-| 5 | **Is the rollback script written, tested, and reviewed?** | Stop. Write it first. |
-| 6 | **Is the backfill idempotent?** | A re-run after a crash must skip already-processed rows without errors |
-| 7 | **Is the divergence check written?** | Must pass before flipping reads (Phase 2 → Phase 3) |
-| 8 | **Is the migration compatible with both N and N-1 app versions?** | Do not drop old schema while the previous app version still reads it |
-| 9 | **Are `statement_timeout` / `lock_timeout` / `innodb_lock_wait_timeout` set?** | Set them. No migration should run for unbounded time. |
-| 10 | **Is replication lag being monitored with an alert?** | Set an alert threshold and pause the backfill if it fires |
-| 11 | **Is the runbook complete and signed off by a second engineer?** | No single-engineer sign-off on Medium or High risk migrations |
+| 2 | **Does this operation lock the table?** | Use `CONCURRENTLY` for indexes; `NOT VALID` for FK constraints; set `lock_timeout = '5s'` |
+| 3 | **Is there sufficient free disk space?** | 2× table size for rewrites; 1× index size for new indexes; **1.5× for backfills due to dead-tuple bloat** |
+| 4 | **Is autovacuum healthy on the target table?** | Check `n_dead_tup` baseline; tune `autovacuum_vacuum_scale_factor` if > default 0.2; verify autovacuum is not disabled |
+| 5 | **Is `lock_timeout = '5s'` set at the top of the migration script?** | Add it. No DDL statement should silently queue and cascade. |
+| 6 | **Will the application stay live?** | If yes → Incremental. If maintenance window acceptable → Big Bang may be fine |
+| 7 | **Is the rollback script written, tested, and reviewed?** | Stop. Write it first. |
+| 8 | **Is the backfill idempotent?** | A re-run after a crash must skip already-processed rows without errors |
+| 9 | **Is the divergence check written?** | Must pass before flipping reads (Phase 2 → Phase 3) |
+| 10 | **Is the migration compatible with both N and N-1 app versions?** | Do not drop old schema while the previous app version still reads it |
+| 11 | **Are `statement_timeout` / `lock_timeout` / `innodb_lock_wait_timeout` set?** | No migration should run for unbounded time |
+| 12 | **Is replication lag being monitored with an alert?** | Set an alert threshold and pause the backfill if it fires |
+| 13 | **Will you run `REINDEX CONCURRENTLY` after the backfill?** | Index bloat from dead tuples must be addressed — don't skip this step |
+| 14 | **Is the TXID age below 1B before starting?** | Check `SELECT age(datfrozenxid) FROM pg_database` — if > 1B, run `VACUUM FREEZE` first |
+| 15 | **Is the column slot count safe (if using Expand/Contract)?** | Check total `pg_attribute` count including dropped columns; alert at 1,200 |
+| 16 | **Is the runbook complete and signed off by a second engineer?** | No single-engineer sign-off on Medium or High risk migrations |
+| 17 | **Is the migration runner connecting over a stable, encrypted link?** | Check `pg_stat_ssl` to verify TLS is active. A 10ms network blip during a 4-hour index build aborts the entire job — ensure the connection uses keepalives and a stable link |
+| 18 | **Are sequences aligned if moving data to a new table?** | After copying data, sync: `SELECT setval('table_id_seq', (SELECT MAX(id) FROM table))`. Skipping this causes `Duplicate Key` errors on the first insert after read cutover |
+| 19 | **Is `statement_timeout` set on the migration runner connection (not just `lock_timeout`)?** | `lock_timeout` prevents waiting for a lock. `statement_timeout` prevents hanging if a deadlock or runaway query occurs mid-migration. Set both: `SET statement_timeout = '2h'; SET lock_timeout = '5s';` |
+| 20 | **On AWS RDS / Aurora: is I/O burst credit balance sufficient for the full migration duration?** | gp2 volumes have a burst credit bucket that drains at sustained high I/O. A 48-hour backfill on a volume that exhausts its credits within 12 hours will throttle to baseline throughput mid-migration — silently. Check `BurstBalance` in CloudWatch before starting. If below 50%, switch to gp3 (no burst model; consistent IOPS) or provision additional IOPS before the migration window. On gp3 and io1/io2 volumes this does not apply. |
+| 19 | **Is `statement_timeout` set on the migration runner connection (not just `lock_timeout`)?** | `lock_timeout` prevents waiting for a lock. `statement_timeout` prevents hanging if a deadlock or runaway query occurs mid-migration. Set both: `SET statement_timeout = '2h'; SET lock_timeout = '5s';` |
 
 ---
 
@@ -2086,15 +2022,16 @@ Answer every question before starting. Do not proceed on any "no" or "I don't kn
 - [PostgreSQL — CREATE INDEX CONCURRENTLY](https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY)
 - [PostgreSQL — Lock Monitoring](https://www.postgresql.org/docs/current/monitoring-locks.html)
 - [PostgreSQL — NOT VALID Constraints](https://www.postgresql.org/docs/current/sql-altertable.html)
+- [PostgreSQL — Routine Vacuuming](https://www.postgresql.org/docs/current/routine-vacuuming.html)
+- [PostgreSQL — Preventing Transaction ID Wraparound](https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND)
 - [MySQL — Online DDL Operations](https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html)
-- [MySQL — InnoDB Lock Wait Timeout](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_lock_wait_timeout)
 - [Flyway Documentation](https://flywaydb.org/documentation)
 - [Liquibase Documentation](https://docs.liquibase.com)
 - [Mongock Documentation](https://mongock.io/docs)
 - [Confluent Schema Registry — Schema Evolution](https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html)
-- [Qdrant Migration Tool (GitHub)](https://github.com/qdrant/migration)
 - [Stripe Engineering — Online Migrations at Scale](https://stripe.com/blog/online-migrations)
 - [AWS Database Migration Service](https://aws.amazon.com/dms/)
 - [gh-ost — GitHub's Online Schema Change for MySQL](https://github.com/github/gh-ost)
-
----
+- [PostgreSQL — ALTER TYPE (ENUM)](https://www.postgresql.org/docs/current/sql-altertype.html)
+- [PostgreSQL — autovacuum Configuration](https://www.postgresql.org/docs/current/runtime-config-autovacuum.html)
+- [PostgreSQL — JSON Functions and Operators](https://www.postgresql.org/docs/current/functions-json.html)
