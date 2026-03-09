@@ -1,5 +1,5 @@
 # API Version Migration
-> How to evolve your APIs without breaking clients — REST, GraphQL, gRPC, WebSockets, and more
+> How to evolve your APIs without breaking clients — REST, GraphQL, gRPC, WebSockets, Message Queues, SOAP, and GraphQL Federation
 
 ---
 
@@ -11,9 +11,10 @@ This document covers all major API types with concrete examples. It is written f
 
 - **New to API design?** Start at Section 1 and read linearly.
 - **Experienced engineer?** Jump to the API type you are working with using Quick Navigation.
-- **Want to know what your framework gives you out of the box?** Go to [Section 4b](#4b-framework-versioning-support) — coverage of Spring Boot 7, ASP.NET Core, DRF, NestJS, Laravel, Rails, and Go with copy-paste examples.
+- **Want to know what your framework gives you out of the box?** Go to [Section 4b](#4b-framework-versioning-support) — framework-by-framework overview and support matrix covering Spring Framework 7 / Boot 4, ASP.NET Core, DRF, NestJS, Laravel, Rails, and Go.
 - **On Spring Framework 7 / Spring Boot 4?** Go to [Section 4c](#4c-spring-framework-7--spring-boot-4) for the full native `configureApiVersioning()` deep-dive, including Kotlin and WebFlux examples.
 - **Preparing for a Tech Lead interview?** Read every "What goes wrong in production" box — those are worth more than the theory.
+- **Versioning Message Queues, SOAP, or GraphQL Federation?** Go to [Section 7b — Message Queues](#7b-message-queue--event-driven-api-versioning), [Section 7c — SOAP](#7c-soap--legacy-xml-api-versioning), or [Section 7d — GraphQL Federation](#7d-graphql-federation-versioning).
 - **Just need a checklist?** Go straight to [Section 14](#14-api-migration-execution-checklist).
 
 ---
@@ -42,7 +43,7 @@ This document covers all major API types with concrete examples. It is written f
 | Handle SOAP / Legacy XML versioning | [Section 7c — SOAP](#7c-soap--legacy-xml-api-versioning) |
 | Handle GraphQL Federation versioning | [Section 7d — GraphQL Federation](#7d-graphql-federation-versioning) |
 
-**Framework & Infrastructure**
+**Implementation & Operations**
 
 | I want to... | Go to |
 |---|---|
@@ -154,6 +155,7 @@ Most migration strategies focus on backward compatibility. Forward compatibility
 | **Changing OAuth scopes** | Issue new scopes alongside old ones. Old tokens with old scopes continue to work. After sunset, return a clear error: `{"error": "scope_deprecated", "required_scope": "users:read:v2"}` |
 | **Rotating JWT signing keys** | Support the old key for a rolling window (24–48 hours minimum). Never invalidate all existing tokens instantly — users mid-session will be logged out. |
 | **Removing auth entirely** | Requires security sign-off. Usually only valid for public read-only endpoints. Document the decision and rationale in your change log. |
+| **Migrating to mTLS (service-to-service)** | Common in zero-trust environments. Issue client certificates alongside existing auth during transition. Services must validate the client cert in addition to (then instead of) the old credential. Coordinate cert rotation windows — mTLS cert expiry is a breaking operational event. Never let certs expire silently; add expiry alerting before any mTLS migration goes live. |
 
 > **⚠️ Enum additions are sneaky.** Adding a new enum value is technically non-breaking on the server side, but breaks clients that use exhaustive switch statements or strict enum parsers. Always communicate new enum values in advance, and design clients to handle unknown values gracefully.
 
@@ -374,14 +376,14 @@ app_v2 = FastAPI(title="User API", version="2.0.0", docs_url="/v2/docs")
 
 ## 4b. Framework Versioning Support — What Your Stack Provides Out of the Box
 
-Before writing custom routing logic, check what your framework already gives you. This is a concise overview — it tells you *what exists*, not a full implementation guide. For Spring Boot 7 implementation detail, see [Section 4c](#4c-spring-boot-7--spring-framework-7).
+Before writing custom routing logic, check what your framework already gives you. This is a concise overview — it tells you *what exists*, not a full implementation guide. For Spring Framework 7 / Spring Boot 4 implementation detail, see [Section 4c](#4c-spring-framework-7--spring-boot-4).
 
-**Jump to your framework:** [Spring Boot 7](#spring-boot-7--framework-7) | [Spring Boot 3.x](#spring-boot-3x) | [ASP.NET Core](#aspnet-core-net-8) | [Django REST Framework](#django-rest-framework) | [FastAPI](#fastapi) | [NestJS](#nestjs) | [Laravel](#laravel) | [Rails](#ruby-on-rails) | [Express / Go](#expressjs--go)
+**Jump to your framework:** [Spring Framework 7 / Boot 4](#spring-framework-7--spring-boot-4) | [Spring Boot 3.x](#spring-boot-3x) | [ASP.NET Core](#aspnet-core-net-8) | [Django REST Framework](#django-rest-framework) | [FastAPI](#fastapi) | [NestJS](#nestjs) | [Laravel](#laravel) | [Rails](#ruby-on-rails) | [Express / Go](#expressjs--go)
 
 ### Versioning Support Matrix
 
 | Framework | URL Path | Header | Query Param | Media Type | Auto Deprecation Headers | Notes |
-|---|---|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|
 | **Spring Boot 4 / Framework 7** | Native | Native | Native | Native | `StandardApiVersionDeprecationHandler` | First full native support — see Section 4c |
 | **Spring Boot 3.x** | Convention | Custom `RequestCondition` | Manual | Manual | Custom filter required | No built-in versioning API |
 | **ASP.NET Core (.NET 8+)** | `Asp.Versioning` pkg | `HeaderApiVersionReader` | `QueryStringApiVersionReader` | `MediaTypeApiVersionReader` | `api-deprecated-versions` header | Official Microsoft NuGet — not in core runtime |
@@ -396,7 +398,7 @@ Before writing custom routing logic, check what your framework already gives you
 
 ### Framework-by-Framework Summary
 
-#### Spring Boot 7 / Framework 7
+#### Spring Framework 7 / Spring Boot 4
 
 The only Java framework with full native versioning support (released November 2025). `configureApiVersioning()` on `WebMvcConfigurer` (or `WebFluxConfigurer` for reactive) sets the version resolution strategy globally — header, path segment, query param, or media type. The `version` attribute on `@GetMapping`, `@PostMapping`, etc. pins each handler to a fixed or baseline version (`"1.1+"`). `StandardApiVersionDeprecationHandler` auto-emits RFC-compliant `Deprecation`, `Sunset`, and `Link` headers. Works identically in Java and Kotlin. Full implementation detail in Section 4c.
 
@@ -616,7 +618,7 @@ class UserApiVersionTest {
 
 ### Kotlin and WebFlux Support
 
-**Kotlin:** Spring Boot 7 is fully supported in Kotlin. `WebMvcConfigurer`, `configureApiVersioning()`, and the `version` attribute on `@GetMapping` / `@PostMapping` work identically in Kotlin — the DSL translates directly with no API differences.
+**Kotlin:** Spring Framework 7 / Spring Boot 4 is fully supported in Kotlin. `WebMvcConfigurer`, `configureApiVersioning()`, and the `version` attribute on `@GetMapping` / `@PostMapping` work identically in Kotlin — the DSL translates directly with no API differences.
 
 **Spring WebFlux (reactive):** For reactive applications, replace `WebMvcConfigurer` with `WebFluxConfigurer`. The `configureApiVersioning()` method, its options, and the `version` mapping attribute are identical. `WebClient` uses `ApiVersionInserter` in the same way as `RestClient`, and `WebTestClient.apiVersion()` provides the same test DSL.
 
@@ -626,6 +628,8 @@ class UserApiVersionTest {
 ## 5. GraphQL API Versioning
 
 GraphQL takes a fundamentally different approach to versioning: **the community philosophy is "don't version — evolve."**
+
+> **Apollo Server version note:** The patterns in this section apply to **Apollo Server 4+** (released October 2022). Apollo Server 3 and earlier had different plugin APIs and schema-building patterns. If you are on Apollo Server 3, the `@deprecated` directive and schema evolution rules are identical, but code examples using the `ApolloServer` constructor or plugin API differ. Check your version before applying implementation patterns.
 
 This is not laziness. It is a deliberate design choice. GraphQL's schema is strongly typed and introspectable, which makes schema evolution safer than REST endpoint changes. But "evolve instead of version" still requires discipline.
 
@@ -1007,7 +1011,18 @@ Clients reconnect on disconnect, so migration is straightforward: return an HTTP
 
 ## 7b. Message Queue & Event-Driven API Versioning
 
-Message queues and event-driven systems (Kafka, RabbitMQ, AWS SNS/SQS, Azure Service Bus) have a fundamentally different versioning challenge from request-response APIs: **messages are decoupled in time**. A producer and consumer may not be running the same version simultaneously, and a message published today may be consumed hours, days, or weeks later by a different consumer version.
+Message queues and event-driven systems have a fundamentally different versioning challenge from request-response APIs: **messages are decoupled in time**. A producer and consumer may not be running the same version simultaneously, and a message published today may be consumed hours, days, or weeks later by a different consumer version.
+
+The patterns in this section are primarily written for **Kafka and RabbitMQ**, which have log-based or queue-based semantics with explicit consumer tracking. AWS SNS/SQS and Azure Service Bus behave differently in key ways:
+
+| Platform | Consumer Model | Log Replay | Consumer Lag Metric | Topic Rename Risk |
+|---|---|---|---|---|
+| **Kafka** | Consumer groups with independent offsets | Yes (retention period) | `consumer_lag` per group/partition | High — never rename |
+| **RabbitMQ** | Queue-bound consumers, messages ACK'd/NACK'd | No (messages deleted on consume) | Queue depth | N/A — queues are ephemeral |
+| **AWS SNS/SQS** | Fan-out via SNS topics to SQS queues; no consumer groups | No native replay | Queue depth (CloudWatch) | Low — queues are named independently |
+| **Azure Service Bus** | Topics + subscriptions; sessions for ordering | No native replay | Active message count | Low |
+
+The schema registry and compatibility mode patterns apply to all platforms, but consumer group management, `consumer_lag` monitoring, and topic versioning strategies are **Kafka-specific**. Adapt accordingly for your platform.
 
 ### Why Message Queue Versioning Is Uniquely Hard
 
@@ -1276,6 +1291,8 @@ Always include `updateUrl` — so the app can show a one-tap "Update Now" button
 
 ### Sending App Version on Every Request
 
+> **Cross-platform apps (React Native / Flutter):** The same version header pattern applies. In React Native, add the header at the `fetch` or Axios request interceptor level. In Flutter, configure it in the Dio HTTP client's interceptors (`dio.interceptors.add(...)`). Both approaches give you a single place to set the header across all requests — equivalent to the native iOS/Android interceptor pattern described below.
+
 Include app version as a global interceptor in your mobile HTTP client — not something individual screens have to remember:
 
 ```swift
@@ -1498,8 +1515,6 @@ Most useful when:
 
 ---
 
----
-
 ## 12b. Rollback Strategy — Going Back Fast
 
 Every migration plan must include a rollback plan. "We'll figure it out if something breaks" is not a plan.
@@ -1541,7 +1556,9 @@ Rolling back from step 2 to step 1 is always safe — v1 code never encounters m
 
 You have deployed v2 and migration is active. What exactly should you be watching?
 
-### Core Metrics — Track Per Version
+**For event-driven / message queue APIs**, the equivalent version-traffic metric is consumer lag. Track `consumer_lag` (records-behind) per consumer group per partition in Kafka, or queue depth in SQS/Service Bus. When migrating from schema v1 to v2, lag on the v1 consumer group trending toward zero is your signal that migration is complete — equivalent to watching version-tagged request traffic fall on an HTTP API.
+
+### Core Metrics — Track Per API Version (HTTP / gRPC)
 
 | Metric | Why It Matters |
 |---|---|
@@ -1580,6 +1597,7 @@ Agree on these thresholds **before** you deploy — not during an incident:
 
 > **Write rollback triggers in the migration plan. Not in the post-mortem.**
 
+---
 
 ## 13. What I've Seen Go Wrong in Production
 
@@ -1656,7 +1674,7 @@ Use this before the work starts — not during the incident.
 - [ ] Identify all consumers (traffic analysis + service registry + SDK download stats)
 - [ ] Classify consumers: internal / external partner / public / mobile
 - [ ] Confirm the change is genuinely breaking (use Section 2 tables)
-- [ ] Choose versioning strategy appropriate to your API type (REST / GraphQL / gRPC / WebSocket)
+- [ ] Choose versioning strategy appropriate to your API type (REST / GraphQL / gRPC / WebSocket / Message Queue / SOAP)
 - [ ] Define support window per consumer type
 - [ ] Assign a DRI with an explicit sunset calendar event
 - [ ] Check for contractual SLA obligations on enterprise/partner consumers
@@ -1698,8 +1716,6 @@ Use this before the work starts — not during the incident.
 - [ ] Remove old version code after 30-day observation period
 - [ ] Deprecate and archive the old OpenAPI / Protobuf spec
 - [ ] Write a brief post-migration summary: what worked, what didn't, what to improve next time
-
----
 
 ---
 
@@ -1749,6 +1765,7 @@ Be transparent early. Contact the API provider as soon as you know you will miss
 
 If you are an enterprise customer with a contractual SLA, check your agreement — you may have rights to an extended support window.
 
+---
 
 ## 15. API Type Comparison
 
@@ -1805,15 +1822,16 @@ What type of API are you versioning?
 │   ├── New version? ────────────────────── New URL (wss://api/v2/ws)
 │   └── Protocol negotiation? ───────────── Sec-WebSocket-Protocol subprotocol header
 │
-└── SSE / Streaming
-    └── New version? ────────────────────── New URL (/v2/events)
-
-    Message Queue / Event-Driven
-    ├── Schema change? ──────────────────── Schema evolution with registry (BACKWARD compat mode)
-    ├── Breaking schema change? ─────────── Parallel topics (orders.v1 / orders.v2) + dual publish
-    └── SOAP service?
-        ├── Internal / controlled clients? ─ Separate WSDL + versioned endpoint (/soap/v2/...)
-        └── Migrating to REST? ──────────── Adapter layer (SOAP→REST gateway) + full deprecation window
+├── SSE / Streaming
+│   └── New version? ────────────────────── New URL (/v2/events)
+│
+├── Message Queue / Event-Driven
+│   ├── Schema change? ──────────────────── Schema evolution with registry (BACKWARD compat mode)
+│   └── Breaking schema change? ─────────── Parallel topics (orders.v1 / orders.v2) + dual publish
+│
+└── SOAP / Legacy XML
+    ├── Internal / controlled clients? ───── Separate WSDL + versioned endpoint (/soap/v2/...)
+    └── Migrating to REST? ──────────────── Adapter layer (SOAP→REST gateway) + full deprecation window
 ```
 
 ---
@@ -1823,7 +1841,7 @@ What type of API are you versioning?
 | Principle | Why It Matters |
 |---|---|
 | **This isn't just REST.** | GraphQL, gRPC, WebSocket, and streaming APIs all have distinct versioning models. Apply the right strategy for the right type. |
-| **Check your framework first.** | Spring Boot 7, ASP.NET Core, NestJS, and DRF all ship native versioning support. Reach for a framework primitive before writing custom routing logic. |
+| **Check your framework first.** | Spring Framework 7 / Spring Boot 4, ASP.NET Core, NestJS, and DRF all ship native versioning support. Reach for a framework primitive before writing custom routing logic. |
 | **Message queues version schemas, not endpoints.** | In event-driven systems, the schema is the contract. Use a schema registry with compatibility enforcement (BACKWARD mode by default). Audit DLQs before sunsetting. Never rename a topic as a versioning strategy. |
 | **Every API is a contract.** | Breaking it without warning erodes trust, causes incidents, and costs real engineering time across multiple teams. |
 | **Not every change is breaking.** | Use the breaking-change tables in Section 2. Over-versioning is almost as costly as under-versioning. |
@@ -1833,7 +1851,8 @@ What type of API are you versioning?
 | **Sunset dates need ownership.** | A date without an automated gate and a named DRI is a suggestion, not a commitment. |
 | **Test contracts, don't assume them.** | Pact gives you CI-enforced confirmation that your migration doesn't break registered consumers. |
 | **Monitor traffic, not calendars.** | Never sunset a version because the date arrived. Sunset it because the traffic data says it is safe. |
-| **The real failures are human.** | Forgotten consumers, unnamed owners, reused Protobuf field numbers, and un-enforced sunset dates cause more migrations to fail than bad code. |
+
+> **The single most important principle:** Forgotten consumers, unnamed owners, reused Protobuf field numbers, and un-enforced sunset dates cause more migrations to fail than bad code. Technical correctness is necessary but not sufficient.
 
 ---
 
@@ -1847,7 +1866,7 @@ What type of API are you versioning?
 |---|---|
 | [`database-migrations.md`](./database-migrations.md) | Expand/contract pattern, zero-downtime schema changes, and backfill strategies — essential reading alongside the Rollback section above |
 | [`monolith-to-microservices.md`](./monolith-to-microservices.md) | API versioning becomes more complex when APIs are mid-extraction from a monolith — the Strangler Fig pattern has direct implications for your versioning strategy |
-| [`event-driven-migration.md`](./event-driven-migration.md) | Event schema evolution and Kafka consumer group migration — closely related to WebSocket/streaming versioning |
+| [`event-driven-migration.md`](./event-driven-migration.md) | Event schema evolution and Kafka consumer group migration in depth. **Note:** Section 7b of this document covers event-driven *API versioning* (schema registries, compatibility modes, topic strategies). The separate `event-driven-migration.md` covers the broader migration *execution* — Kafka consumer group rebalancing, state store migrations, and cross-datacenter event replication during migrations. They complement each other; read 7b first. |
 | [`api-management.md`](../standards/api-management.md) | The standards governing API design in this org — versioning decisions should align with these |
 
 ### External References
@@ -1861,4 +1880,3 @@ What type of API are you versioning?
 | [OpenAPI Specification](https://spec.openapis.org/oas/latest.html) | The spec behind OpenAPI/Swagger |
 
 ---
-
